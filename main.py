@@ -38,7 +38,11 @@ positions: dict            = {}  # symbol -> position dict
 block_ts   = datetime.now()
 
 # ── Dhan client ───────────────────────────────────────────────────────────────
-dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
+try:
+    from dhanhq import DhanContext
+    dhan = dhanhq(DhanContext(CLIENT_ID, ACCESS_TOKEN))
+except ImportError:
+    dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)  # fallback for older SDK
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
