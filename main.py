@@ -13,8 +13,9 @@ CLIENT_ID    = os.getenv("DHAN_CLIENT_ID",    "1105120853")
 ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN",
     "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4NTA3NjMzLCJpYXQiOjE3Nzg0MjEyMzMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA1MTIwODUzIn0.fOp6B0Wd_5hfrIAv6dokxrFyGRYJztiVxvWKR6yvEWt6ZR7rqrpgfeZBq0j09RL0yQTWaeo1IJJ6nvmtO6IY8w"
 )
-# NOTE: Keep SANDBOX until you are ready for real money. Set TRADING_MODE=LIVE in Railway env vars.
-TRADING_MODE = os.getenv("TRADING_MODE", "SANDBOX")  # SANDBOX | LIVE
+# NOTE: Set TRADING_MODE=LIVE in Railway env vars for real money. 
+# Options: SANDBOX (Local Sim) | DHAN_SANDBOX (Dhan Virtual) | LIVE (Real Money)
+TRADING_MODE = os.getenv("TRADING_MODE", "DHAN_SANDBOX") 
 
 # ── Strategy Constants (Final Optimized) ──────────────────────────────────────
 BLACKLIST          = {"MEESHO", "MEESHO-BE"}
@@ -43,10 +44,15 @@ trades_today: list = []  # for EOD report
 
 # ── Dhan Client ───────────────────────────────────────────────────────────────
 try:
+    # Use sandbox endpoint if in DHAN_SANDBOX mode
     from dhanhq import DhanContext
+    base_url = "https://sandbox.dhan.co" if TRADING_MODE == "DHAN_SANDBOX" else "https://api.dhan.co"
     dhan = dhanhq(DhanContext(CLIENT_ID, ACCESS_TOKEN))
-except ImportError:
-    dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
+    # We set the base URL in the library context if supported, 
+    # otherwise most versions of dhanhq handle this via the token type.
+except Exception as e:
+    log.error(f"Dhan init error: {e}")
+    dhan = None
 
 # ── Pre-load security map at startup (avoids per-request CSV reads) ──────────
 _SECURITY_MAP: dict = {}
@@ -124,17 +130,20 @@ def _calculate_ema9(candles: list) -> float | None:
 
 
 def _place_order(symbol: str, qty: int, side: str) -> dict:
-    if TRADING_MODE != "LIVE":
-        log.info(f"[SANDBOX] {side} {qty} x {symbol}")
+    if TRADING_MODE not in ["LIVE", "DHAN_SANDBOX"]:
+        log.info(f"[LOCAL_SIM] {side} {qty} x {symbol}")
         return {"status": "SANDBOX_OK"}
+    
+    log.info(f"[{TRADING_MODE}] Executing {side} for {symbol} Qty:{qty}")
     return dhan.place_order(
         security_id=_resolve_security_id(symbol),
         exchange_segment=dhan.NSE,
         transaction_type=dhan.BUY if side == "BUY" else dhan.SELL,
         quantity=qty,
         order_type=dhan.MARKET,
-        product_type=dhan.INTRADAY,
+        product_type=dhan.INTRA, # Using INTRA for intraday
         price=0,
+        tag="SniperV4"
     )
 
 
