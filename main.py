@@ -2,6 +2,7 @@ import os, logging, threading, time, csv
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from dhanhq import dhanhq
+import pandas as pd
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -47,6 +48,18 @@ try:
 except ImportError:
     dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
+# ── Pre-load security map at startup (avoids per-request CSV reads) ──────────
+_SECURITY_MAP: dict = {}
+try:
+    _map_path = os.path.join(os.path.dirname(__file__), "security_map.csv")
+    _df = pd.read_csv(_map_path, low_memory=False)
+    _eq = _df[_df["SEM_INSTRUMENT_NAME"] == "EQUITY"]
+    for _, row in _eq.iterrows():
+        _SECURITY_MAP[str(row["SEM_TRADING_SYMBOL"]).upper()] = str(row["SEM_SMST_SECURITY_ID"])
+    log.info(f"Security map loaded: {len(_SECURITY_MAP)} equity symbols")
+except Exception as e:
+    log.warning(f"Security map load failed: {e} — will fall back to symbol")
+
 app = Flask(__name__)
 
 
@@ -72,17 +85,8 @@ def _market_open(now=None) -> bool:
 
 
 def _resolve_security_id(symbol: str) -> str:
-    try:
-        import pandas as pd
-        path = os.path.join(os.path.dirname(__file__), "security_map.csv")
-        df   = pd.read_csv(path, low_memory=False)
-        row  = df[(df["SEM_TRADING_SYMBOL"] == symbol) &
-                  (df["SEM_INSTRUMENT_NAME"] == "EQUITY")]
-        if not row.empty:
-            return str(row.iloc[0]["SEM_SMST_SECURITY_ID"])
-    except Exception:
-        pass
-    return symbol
+    """Map trading symbol -> Dhan security_id using pre-loaded map."""
+    return _SECURITY_MAP.get(symbol.upper(), symbol)
 
 
 def _get_ltp(symbol: str) -> float | None:
