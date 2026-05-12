@@ -66,22 +66,29 @@ def _load_master():
 
 # ── Dhan Clients ──────────────────────────────────────────────────────────────
 # DATA CLIENT (Main Token for real-time market data)
-try:
-    dhan_data = dhanhq(MAIN_CLIENT_ID, MAIN_ACCESS_TOKEN)
-    log.info("Dhan Data Client (Main Token) Initialized Successfully.")
-except Exception as e:
-    log.error(f"Dhan Data Client init failed: {e}")
-    dhan_data = None
+def _ensure_dhan_data():
+    global dhan_data
+    if dhan_data is None:
+        try:
+            dhan_data = dhanhq(client_id=MAIN_CLIENT_ID, access_token=MAIN_ACCESS_TOKEN)
+            log.info("Dhan Data Client initialized successfully via self-healing block.")
+        except Exception as e:
+            log.error(f"Dhan Data Client init failed: {e}", exc_info=True)
+            dhan_data = None
+
+dhan_data = None
+_ensure_dhan_data()
 
 # ORDER CLIENT (Sandbox Token for simulated execution)
 try:
-    dhan_orders = dhanhq(SANDBOX_CLIENT_ID, SANDBOX_ACCESS_TOKEN)
+    dhan_orders = dhanhq(client_id=SANDBOX_CLIENT_ID, access_token=SANDBOX_ACCESS_TOKEN)
     if hasattr(dhan_orders, 'dhan_http'):
         dhan_orders.dhan_http.base_url = "https://sandbox.dhan.co/v2"
     log.info("Dhan Orders Client (Sandbox Token) Initialized Successfully.")
 except Exception as e:
-    log.error(f"Dhan Orders Client init failed: {e}")
+    log.error(f"Dhan Orders Client init failed: {e}", exc_info=True)
     dhan_orders = None
+
 
 
 # ── Security Map ──────────────────────────────────────────────────────────────
@@ -105,7 +112,8 @@ def _resolve_security_id(symbol: str) -> str:
 
 def _get_ltp(symbol: str) -> float | None:
     try:
-        if not dhan_data: return None
+        _ensure_dhan_data()
+        if dhan_data is None: return None
         sec_id = _resolve_security_id(symbol)
         if not sec_id.isdigit(): return None
         resp = dhan_data.quote_data({"NSE_EQ": [int(sec_id)]})
@@ -117,7 +125,8 @@ def _get_ltp(symbol: str) -> float | None:
 
 def _get_1min_candles(symbol: str, n: int = 10) -> list | None:
     try:
-        if not dhan_data:
+        _ensure_dhan_data()
+        if dhan_data is None:
             log.warning(f"Dhan Data Client offline. Skipping candles for {symbol}")
             return None
         sec_id = _resolve_security_id(symbol)
@@ -182,7 +191,8 @@ def _exit(symbol: str, pos: dict, reason: str, exit_price: float):
 
 # ── Core Engine ───────────────────────────────────────────────────────────────
 def _get_bulk_volumes(symbols: list):
-    if not symbols or not dhan_data: return
+    _ensure_dhan_data()
+    if not symbols or dhan_data is None: return
     try:
         sec_ids = []
         id_to_sym = {}
@@ -302,9 +312,12 @@ def watchdog():
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def dashboard():
+    safe_pos = {}
+    for sym, p in positions.items():
+        safe_pos[sym] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in p.items()}
     return jsonify({
         "status": "ONLINE", "mode": TRADING_MODE, "master": master,
-        "positions": positions, "pending": list(pending.keys()),
+        "positions": safe_pos, "pending": list(pending.keys()),
         "pools": {"1m": len(pool_1m), "3m": len(pool_3m), "5m": len(pool_5m)},
         "trades": trades_today, "total_pnl": round(sum(t["pnl_rs"] for t in trades_today), 2)
     })
