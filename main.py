@@ -66,15 +66,11 @@ def _load_master():
 
 # ── Dhan Clients ──────────────────────────────────────────────────────────────
 try:
-    from dhanhq import DhanContext
-    
     # DATA CLIENT (Main Token for real-time market data)
-    data_ctx = DhanContext(MAIN_CLIENT_ID, MAIN_ACCESS_TOKEN)
-    dhan_data = dhanhq(data_ctx)
+    dhan_data = dhanhq(MAIN_CLIENT_ID, MAIN_ACCESS_TOKEN)
     
     # ORDER CLIENT (Sandbox Token for simulated execution)
-    sb_ctx = DhanContext(SANDBOX_CLIENT_ID, SANDBOX_ACCESS_TOKEN)
-    dhan_orders = dhanhq(sb_ctx)
+    dhan_orders = dhanhq(SANDBOX_CLIENT_ID, SANDBOX_ACCESS_TOKEN)
     
     # CRITICAL: Manually override to point to Sandbox API
     if hasattr(dhan_orders, 'dhan_http'):
@@ -107,9 +103,11 @@ def _resolve_security_id(symbol: str) -> str:
 
 def _get_ltp(symbol: str) -> float | None:
     try:
-        resp = dhan.get_quote(symbol)
-        return float(resp["data"]["last_price"])
-    except: return None
+        # Fallback to fetching 1min candle close since get_quote signature varies or might have rate limits
+        candles = _get_1min_candles(symbol, n=1)
+        if candles: return float(candles[-1]["close"])
+    except: pass
+    return None
 
 def _get_1min_candles(symbol: str, n: int = 10) -> list | None:
     try:
@@ -118,9 +116,7 @@ def _get_1min_candles(symbol: str, n: int = 10) -> list | None:
         resp = dhan_data.intraday_minute_data(sec_id, "NSE_EQ", "EQUITY", today, today)
         if resp.get("status") == "success" and resp.get("data"):
             d = resp["data"]
-            # Convert dictionary of lists to list of dictionaries
-            # Dhan V2 format: {'open': [...], 'high': [...], 'timestamp': [...]}
-            ts_key = 'timestamp' if 'timestamp' in d else 'start_Time'
+            ts_key = 'timestamp' if 'timestamp' in d else ('start_Time' if 'start_Time' in d else 'start_time')
             l = len(d.get('close', []))
             if l == 0: return None
             
@@ -197,10 +193,14 @@ def _rebuild_master():
     def get_top_n(pool, limit):
         # Filter by time and count frequencies
         counts = {}
-        for s, t_list in pool.items():
-            valid_t = [t for t in t_list if t > cutoff]
-            pool[s] = valid_t # Prune pool
-            if valid_t: counts[s] = len(valid_t)
+        # Iterate over a copy of keys to safely prune pool in-place
+        for s in list(pool.keys()):
+            valid_t = [t for t in pool[s] if t > cutoff]
+            if valid_t:
+                pool[s] = valid_t # Prune pool keeping valid timestamps
+                counts[s] = len(valid_t)
+            else:
+                pool.pop(s, None)
             
         if not counts: return []
         
@@ -252,17 +252,22 @@ def watchdog():
     while True:
         try:
             now = datetime.now()
-            for sym in list(pending): _evaluate_smart_entry(sym)
-            for sym in list(positions):
+            # Use list() to create a copy of keys so we can mutate dictionaries safely during iteration
+            for sym in list(pending.keys()): _evaluate_smart_entry(sym)
+            for sym in list(positions.keys()):
+                if sym not in positions: continue
                 pos = positions[sym]
+                # Avoid calling live quote API continuously in loops if data client supports quote
+                # Or retrieve quote safely. Let's ensure _get_ltp works correctly.
                 ltp = _get_ltp(sym)
                 if not ltp: continue
                 if ltp > pos["peak"]: pos["peak"] = ltp
                 if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + TSL_TRIGGER_PCT):
                     pos["tsl_on"] = True
+                    log.info(f"TSL ACTIVATED for {sym} at {ltp}")
                 if pos["tsl_on"]:
                     floor = pos["peak"] * (1 - TSL_TRAIL_PCT)
-                    if floor > pos["sl"]: pos["sl"] = floor
+                    if floor > pos["sl"]: pos["sl"] = round(floor, 2)
                 
                 reason = None
                 if ltp <= pos["sl"]: reason = "SL_HIT"
