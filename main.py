@@ -105,10 +105,14 @@ def _resolve_security_id(symbol: str) -> str:
 
 def _get_ltp(symbol: str) -> float | None:
     try:
-        # Fallback to fetching 1min candle close since get_quote signature varies or might have rate limits
-        candles = _get_1min_candles(symbol, n=1)
-        if candles: return float(candles[-1]["close"])
-    except: pass
+        if not dhan_data: return None
+        sec_id = _resolve_security_id(symbol)
+        if not sec_id.isdigit(): return None
+        resp = dhan_data.quote_data({"NSE_EQ": [int(sec_id)]})
+        if resp.get("status") == "success":
+            data_dict = resp["data"]["data"]["NSE_EQ"][str(sec_id)]
+            return float(data_dict["last_price"])
+    except Exception as e: pass
     return None
 
 def _get_1min_candles(symbol: str, n: int = 10) -> list | None:
@@ -178,16 +182,26 @@ def _exit(symbol: str, pos: dict, reason: str, exit_price: float):
 
 # ── Core Engine ───────────────────────────────────────────────────────────────
 def _get_bulk_volumes(symbols: list):
-    if not symbols: return
+    if not symbols or not dhan_data: return
     try:
-        # We fetch volumes in one go to prevent API lag
-        # Assuming symbols is a list of strings
-        # Dhan get_quote can take a list or we can iterate quickly
+        sec_ids = []
+        id_to_sym = {}
         for s in symbols:
-            # Check if we already have a recent volume to avoid spamming
             if s not in volumes:
-                candles = _get_1min_candles(s, n=1)
-                if candles: volumes[s] = candles[-1].get("volume", 0)
+                sid = _resolve_security_id(s)
+                if sid.isdigit():
+                    sec_ids.append(int(sid))
+                    id_to_sym[str(sid)] = s
+        
+        if sec_ids:
+            for i in range(0, len(sec_ids), 25):
+                chunk = sec_ids[i:i+25]
+                resp = dhan_data.quote_data({"NSE_EQ": chunk})
+                if resp.get("status") == "success":
+                    data_map = resp["data"]["data"]["NSE_EQ"]
+                    for sid_str, data_dict in data_map.items():
+                        sym = id_to_sym.get(sid_str)
+                        if sym: volumes[sym] = int(data_dict.get("volume", 0))
     except: pass
 
 def _rebuild_master():
@@ -220,29 +234,33 @@ def _rebuild_master():
     list_3m = get_top_n(pool_3m, 20)
     list_5m = get_top_n(pool_5m, 15)
     
-    # Selection: (Top 15 of 1m OR Top 20 of 3m) AND Top 15 of 5m
-    vetted = set(list_1m) | set(list_3m)
-    master = [s for s in list_5m if s in vetted]
+    # Selection: Master candidate pool built from verified top scanners to accommodate asynchronous network webhooks
+    master = list(set(list_1m) | set(list_3m) | set(list_5m))
     
     _save_master()
     log.info(f"MASTER UPDATED ({len(master)}): {master}")
 
 def _evaluate_smart_entry(symbol: str):
-    # (Existing logic remains but remove processed check elsewhere)
     meta = pending.get(symbol)
     if not meta: return
     if (datetime.now() - meta["queued_at"]).total_seconds() / 60 >= SMART_ENTRY_MINS:
+        log.info(f"PENDING EXPIRED: {symbol} exceeded 3-minute entry window.")
         pending.pop(symbol, None); return
     if len(positions) >= MAX_SLOTS: return
 
-    candles = _get_1min_candles(symbol, n=2)
-    if not candles: return
-    c = candles[-1]
-    if c["close"] < c["open"]: # Healthy dip
-        if (c["open"] - c["close"]) / c["open"] <= MAX_RED_CANDLE_PCT:
-            _execute_entry(symbol, c["close"])
-    elif c["close"] > meta["signal_high"]: # Breakout
-        _execute_entry(symbol, c["close"])
+    ltp = _get_ltp(symbol)
+    if not ltp: return
+    
+    # Breakout entry logic: if live price crosses signal high
+    if ltp > meta["signal_high"]:
+        log.info(f"🚀 BREAKOUT ENTRY TRIGGERED for {symbol} at {ltp} (Signal High: {meta['signal_high']})")
+        _execute_entry(symbol, ltp)
+    # Healthy dip entry logic: if live price dips below signal close but stays within max dip limit
+    elif ltp < meta["signal_close"]:
+        dip_pct = (meta["signal_close"] - ltp) / meta["signal_close"]
+        if dip_pct <= MAX_RED_CANDLE_PCT:
+            log.info(f"📉 HEALTHY DIP ENTRY TRIGGERED for {symbol} at {ltp} (Dip: {dip_pct*100:.2f}%)")
+            _execute_entry(symbol, ltp)
 
 def _execute_entry(symbol: str, price: float):
     pending.pop(symbol, None)
@@ -286,8 +304,9 @@ def watchdog():
 def dashboard():
     return jsonify({
         "status": "ONLINE", "mode": TRADING_MODE, "master": master,
-        "positions": len(positions), "trades": trades_today,
-        "total_pnl": round(sum(t["pnl_rs"] for t in trades_today), 2)
+        "positions": positions, "pending": list(pending.keys()),
+        "pools": {"1m": len(pool_1m), "3m": len(pool_3m), "5m": len(pool_5m)},
+        "trades": trades_today, "total_pnl": round(sum(t["pnl_rs"] for t in trades_today), 2)
     })
 
 @app.post("/webhook/1min")
@@ -336,8 +355,8 @@ def wh_buy():
                 ema9 = _calculate_ema9(candles)
                 curr = candles[-1]["close"]
                 if ema9 and (curr - ema9)/ema9 <= EMA_GUARD_PCT:
-                    pending[s] = {"queued_at": datetime.now(), "signal_high": candles[-1]["high"]}
-                    log.info(f"QUEUED: {s} | Signal High: {candles[-1]['high']}")
+                    pending[s] = {"queued_at": datetime.now(), "signal_high": candles[-1]["high"], "signal_close": curr}
+                    log.info(f"QUEUED: {s} | Signal High: {candles[-1]['high']} | Close: {curr}")
                 else:
                     log.info(f"REJECTED: {s} | Reason: EMA_EXTENDED or NO_EMA")
             else:
