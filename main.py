@@ -1,7 +1,9 @@
+import atexit
 import itertools
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -26,10 +28,11 @@ log = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
-MAIN_CLIENT_ID = os.getenv("MAIN_CLIENT_ID", "1105120853")
+MAIN_CLIENT_ID = os.getenv("MAIN_CLIENT_ID") or os.getenv("DHAN_CLIENT_ID") or "1105120853"
 MAIN_ACCESS_TOKEN = os.getenv(
     "MAIN_ACCESS_TOKEN",
-    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4Njk1OTE4LCJpYXQiOjE3Nzg2MDk1MTgsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA1MTIwODUzIn0.ryp89RF2HByisq6xld12NprBtOzYpNYQrkxen3Bdxq9zfvH8pJejPNd61ZJ-fxUaOP09w13dBIkbA9s6up6LgA",
+    os.getenv("DHAN_ACCESS_TOKEN")
+    or "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4Njk1OTE4LCJpYXQiOjE3Nzg2MDk1MTgsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA1MTIwODUzIn0.ryp89RF2HByisq6xld12NprBtOzYpNYQrkxen3Bdxq9zfvH8pJejPNd61ZJ-fxUaOP09w13dBIkbA9s6up6LgA",
 )
 SANDBOX_CLIENT_ID = os.getenv("SANDBOX_CLIENT_ID", "2605019607")
 SANDBOX_ACCESS_TOKEN = os.getenv(
@@ -39,7 +42,17 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
 
 TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
-LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.dirname(__file__), "runtime_logs"))
+DEFAULT_LOG_DIR = os.path.join(
+    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.join(os.path.dirname(__file__), "runtime_logs")),
+    "runtime_logs",
+)
+LOG_DIR = os.getenv("LOG_DIR", DEFAULT_LOG_DIR)
+STATE_FILE = os.path.join(LOG_DIR, "runtime_state.json")
+EVENT_DB_FILE = os.path.join(LOG_DIR, "runtime_events.sqlite3")
+MAX_RECENT_SHADOW_EVENTS = 500
+STATE_SAVE_DEBOUNCE_SECS = float(os.getenv("STATE_SAVE_DEBOUNCE_SECS", "1.0"))
+QUOTE_CACHE_TTL_SECS = float(os.getenv("QUOTE_CACHE_TTL_SECS", "1.0"))
+CANDLE_CACHE_TTL_SECS = float(os.getenv("CANDLE_CACHE_TTL_SECS", "12.0"))
 
 BLACKLIST = {"MEESHO", "MEESHO-BE"}
 MAX_SLOTS = 8
@@ -73,7 +86,11 @@ state_lock = threading.RLock()
 log_lock = threading.RLock()
 watchdog_started = False
 order_counter = itertools.count(1)
-shadow_recent_events = deque(maxlen=500)
+state_dirty = False
+last_state_save_ts = 0.0
+quote_cache: dict[str, dict] = {}
+candle_cache: dict[str, dict] = {}
+shadow_recent_events = deque(maxlen=MAX_RECENT_SHADOW_EVENTS)
 
 app = Flask(__name__)
 
@@ -92,12 +109,55 @@ def _make_id(prefix: str) -> str:
     return f"{prefix}_{_now().strftime('%Y%m%d_%H%M%S')}_{next(order_counter):05d}"
 
 
+def _init_event_db():
+    try:
+        with sqlite3.connect(EVENT_DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    stream TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_stream_ts ON events(stream, ts DESC)"
+            )
+            conn.commit()
+    except Exception as exc:
+        log.warning("Failed to initialize event db: %s", exc)
+
+
+def _mark_state_dirty():
+    global state_dirty
+    state_dirty = True
+
+
+def _atomic_write_json(path: str, payload: dict):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True)
+    os.replace(tmp_path, path)
+
+
 def _append_event(stream: str, event_type: str, payload: dict):
-    event = {"ts": _now().isoformat(), "stream": stream, "event": event_type, **payload}
+    event = {"ts": _now().isoformat(), "stream": stream, "event": event_type, **_serialize_value(payload)}
     path = os.path.join(LOG_DIR, f"{stream}_{_today_tag()}.jsonl")
     with log_lock:
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, default=str) + "\n")
+            handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+        try:
+            with sqlite3.connect(EVENT_DB_FILE) as conn:
+                conn.execute(
+                    "INSERT INTO events(ts, stream, event_type, payload_json) VALUES (?, ?, ?, ?)",
+                    (event["ts"], stream, event_type, json.dumps(event, ensure_ascii=True)),
+                )
+                conn.commit()
+        except Exception as exc:
+            log.warning("Failed to append event to sqlite: %s", exc)
     if stream == "shadow":
         shadow_recent_events.append(event)
     return event
@@ -111,6 +171,34 @@ def _serialize_value(value):
     if isinstance(value, list):
         return [_serialize_value(item) for item in value]
     return value
+
+
+def _parse_dt(value):
+    if isinstance(value, datetime):
+        return value
+    return _parse_candle_time(value)
+
+
+def _load_recent_shadow_events():
+    if not os.path.exists(EVENT_DB_FILE):
+        return
+    try:
+        with sqlite3.connect(EVENT_DB_FILE) as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json
+                FROM events
+                WHERE stream = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                ("shadow", MAX_RECENT_SHADOW_EVENTS),
+            ).fetchall()
+        shadow_recent_events.clear()
+        for (payload_json,) in reversed(rows):
+            shadow_recent_events.append(json.loads(payload_json))
+    except Exception as exc:
+        log.warning("Failed to restore recent shadow events: %s", exc)
 
 
 def _parse_candle_time(raw) -> datetime | None:
@@ -157,6 +245,132 @@ def _parse_symbols_from_request() -> list[str]:
         seen.add(symbol)
         symbols.append(symbol)
     return symbols
+
+
+def _pool_to_json(pool: dict[str, list[datetime]]) -> dict[str, list[str]]:
+    return {symbol: [stamp.isoformat() for stamp in stamps] for symbol, stamps in pool.items()}
+
+
+def _pool_from_json(raw: dict) -> dict[str, list[datetime]]:
+    parsed = {}
+    for symbol, items in (raw or {}).items():
+        stamps = []
+        for item in items or []:
+            stamp = _parse_dt(item)
+            if stamp is not None:
+                stamps.append(stamp)
+        if stamps:
+            parsed[str(symbol).upper()] = stamps
+    return parsed
+
+
+def _position_from_json(raw: dict) -> dict:
+    data = dict(raw or {})
+    for key in ("entry_time",):
+        if key in data:
+            data[key] = _parse_dt(data.get(key))
+    return data
+
+
+def _pending_from_json(raw: dict) -> dict:
+    data = dict(raw or {})
+    for key in ("queued_at", "expires_at", "signal_candle_time", "last_candle_check"):
+        if key in data:
+            data[key] = _parse_dt(data.get(key))
+    return data
+
+
+def _save_runtime_state(force: bool = False):
+    global state_dirty, last_state_save_ts
+
+    if not force and not state_dirty:
+        return
+
+    now_ts = time.time()
+    if not force and (now_ts - last_state_save_ts) < STATE_SAVE_DEBOUNCE_SECS:
+        return
+
+    with state_lock:
+        payload = {
+            "saved_at": _now().isoformat(),
+            "master": list(master),
+            "pool_1m": _pool_to_json(pool_1m),
+            "pool_3m": _pool_to_json(pool_3m),
+            "pool_5m": _pool_to_json(pool_5m),
+            "volumes": dict(volumes),
+            "positions": _serialize_value(positions),
+            "shadow_positions": _serialize_value(shadow_positions),
+            "pending": _serialize_value(pending),
+            "trades_today": _serialize_value(trades_today[-500:]),
+            "shadow_trades": _serialize_value(shadow_trades[-500:]),
+        }
+
+    try:
+        _atomic_write_json(STATE_FILE, payload)
+        last_state_save_ts = now_ts
+        state_dirty = False
+    except Exception as exc:
+        log.warning("Failed to save runtime state: %s", exc)
+
+
+def _load_runtime_state():
+    global master, volumes
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        log.warning("Failed to load runtime state: %s", exc)
+        return
+
+    with state_lock:
+        master[:] = [str(item).upper() for item in payload.get("master", [])]
+        volumes.clear()
+        volumes.update({str(k).upper(): int(v or 0) for k, v in (payload.get("volumes") or {}).items()})
+
+        pool_1m.clear()
+        pool_1m.update(_pool_from_json(payload.get("pool_1m") or {}))
+        pool_3m.clear()
+        pool_3m.update(_pool_from_json(payload.get("pool_3m") or {}))
+        pool_5m.clear()
+        pool_5m.update(_pool_from_json(payload.get("pool_5m") or {}))
+
+        positions.clear()
+        positions.update(
+            {
+                str(symbol).upper(): _position_from_json(pos)
+                for symbol, pos in (payload.get("positions") or {}).items()
+            }
+        )
+        shadow_positions.clear()
+        shadow_positions.update(
+            {
+                str(symbol).upper(): _position_from_json(pos)
+                for symbol, pos in (payload.get("shadow_positions") or {}).items()
+            }
+        )
+        pending.clear()
+        pending.update(
+            {
+                str(symbol).upper(): _pending_from_json(pos)
+                for symbol, pos in (payload.get("pending") or {}).items()
+            }
+        )
+        trades_today.clear()
+        trades_today.extend(payload.get("trades_today") or [])
+        shadow_trades.clear()
+        shadow_trades.extend(payload.get("shadow_trades") or [])
+
+    log.info(
+        "Restored runtime state: master=%s pending=%s baseline_open=%s shadow_open=%s",
+        len(master),
+        len(pending),
+        len(positions),
+        len(shadow_positions),
+    )
 
 
 def _save_master():
@@ -230,6 +444,11 @@ depth_manager = DepthFeedManager(
 
 
 def _get_quote_snapshot(symbol: str) -> dict | None:
+    cache_key = symbol.upper()
+    cached = quote_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) <= QUOTE_CACHE_TTL_SECS:
+        return dict(cached["quote"])
+
     try:
         _ensure_dhan_data()
         if dhan_data is None:
@@ -245,12 +464,18 @@ def _get_quote_snapshot(symbol: str) -> dict | None:
 
         quote = resp["data"]["data"]["NSE_EQ"].get(str(sec_id), {})
         quote["security_id"] = str(sec_id)
+        quote_cache[cache_key] = {"ts": time.time(), "quote": dict(quote)}
         return quote
     except Exception:
         return None
 
 
 def _get_ltp(symbol: str) -> float | None:
+    depth_now, _, _ = depth_manager.get(symbol)
+    if depth_now:
+        depth_ltp = float(depth_now.get("ltp", 0) or 0)
+        if depth_ltp > 0:
+            return depth_ltp
     quote = _get_quote_snapshot(symbol)
     if not quote:
         return None
@@ -291,6 +516,12 @@ def _get_bulk_volumes(symbols: list[str]):
 
 
 def _get_1min_candles(symbol: str, n: int = 35) -> list[dict] | None:
+    cache_key = symbol.upper()
+    cached = candle_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) <= CANDLE_CACHE_TTL_SECS:
+        candles = cached["candles"]
+        return candles[-n:] if candles else None
+
     try:
         _ensure_dhan_data()
         if dhan_data is None:
@@ -326,6 +557,7 @@ def _get_1min_candles(symbol: str, n: int = 35) -> list[dict] | None:
                     "time": data.get(ts_key, [0] * length)[idx],
                 }
             )
+        candle_cache[cache_key] = {"ts": time.time(), "candles": candles}
         return candles[-n:]
     except Exception as exc:
         log.warning("1m candle fetch failed for %s: %s", symbol, exc)
@@ -386,12 +618,16 @@ def _place_order(symbol: str, qty: int, side: str, trade_id: str):
 def _prune_pool(pool: dict[str, list[datetime]], cutoff: datetime) -> dict[str, int]:
     counts = {}
     for symbol in list(pool.keys()):
-        valid = [stamp for stamp in pool[symbol] if stamp >= cutoff]
+        original = pool[symbol]
+        valid = [stamp for stamp in original if stamp >= cutoff]
         if valid:
             pool[symbol] = valid
             counts[symbol] = len(valid)
+            if len(valid) != len(original):
+                _mark_state_dirty()
         else:
             pool.pop(symbol, None)
+            _mark_state_dirty()
     return counts
 
 
@@ -429,6 +665,7 @@ def _rebuild_master() -> list[str]:
     with state_lock:
         master = final_master
         _save_master()
+        _mark_state_dirty()
 
     depth_manager.ensure_symbols(combined[:50])
     log.info("MASTER UPDATED (%s): %s", len(final_master), final_master)
@@ -539,6 +776,7 @@ def _queue_signal(symbol: str) -> bool:
             "signal_payload": {"high": float(signal_candle["high"]), "close": float(signal_candle["close"])},
             "depth_signal_ctx": depth_ctx,
         }
+        _mark_state_dirty()
 
     _append_event(
         "baseline",
@@ -583,11 +821,13 @@ def _extract_healthy_dip(symbol: str, meta: dict) -> dict | None:
             with state_lock:
                 if symbol in pending:
                     pending[symbol]["last_candle_check"] = newest_seen
+                    _mark_state_dirty()
             return {"entry_price": close_price, "dip_pct": dip_pct, "candle_time": candle_time}
 
     with state_lock:
         if symbol in pending:
             pending[symbol]["last_candle_check"] = newest_seen
+            _mark_state_dirty()
     return None
 
 
@@ -627,6 +867,7 @@ def _open_shadow_position(symbol: str, price: float, qty: int, trigger: str, bas
             "wall_timers": {},
             "last_snapshot_log": 0.0,
         }
+        _mark_state_dirty()
 
     _append_event("shadow", "entry_opened", payload | {"shadow_trade_id": shadow_trade_id})
 
@@ -635,6 +876,7 @@ def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
     with state_lock:
         if symbol in positions:
             pending.pop(symbol, None)
+            _mark_state_dirty()
             return False
         if len(positions) >= MAX_SLOTS:
             return False
@@ -647,6 +889,7 @@ def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
     if not accepted:
         with state_lock:
             pending.pop(symbol, None)
+            _mark_state_dirty()
         log.error("ENTRY FAILED %s | response=%s", symbol, order_resp)
         return False
 
@@ -665,6 +908,7 @@ def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
             "trigger": trigger,
             "order": order_resp,
         }
+        _mark_state_dirty()
 
     _append_event(
         "baseline",
@@ -701,6 +945,7 @@ def _close_shadow_position(symbol: str, pos: dict, reason: str, exit_price: floa
     with state_lock:
         shadow_positions.pop(symbol, None)
         shadow_trades.append(trade)
+        _mark_state_dirty()
     _append_event("shadow", "exit_closed", trade)
 
 
@@ -722,6 +967,7 @@ def _exit(symbol: str, pos: dict, reason: str, exit_price: float):
     with state_lock:
         positions.pop(symbol, None)
         trades_today.append(trade)
+        _mark_state_dirty()
     _append_event("baseline", "exit_closed", trade)
 
 
@@ -737,6 +983,7 @@ def _evaluate_pending(symbol: str):
     if now >= meta["expires_at"]:
         with state_lock:
             pending.pop(symbol, None)
+            _mark_state_dirty()
         _append_event("baseline", "pending_expired", {"symbol": symbol})
         return
 
@@ -789,6 +1036,7 @@ def _evaluate_positions():
             live_pos["peak"] = pos["peak"]
             live_pos["tsl_on"] = pos["tsl_on"]
             live_pos["sl"] = pos["sl"]
+            _mark_state_dirty()
             pos = dict(live_pos)
 
         reason = None
@@ -853,6 +1101,8 @@ def _evaluate_shadow_positions():
             live_pos["tsl_on"] = pos["tsl_on"]
             live_pos["sl"] = pos["sl"]
             live_pos["neg_velocity_since"] = pos.get("neg_velocity_since")
+            live_pos["wall_timers"] = pos.get("wall_timers", {})
+            _mark_state_dirty()
             pos = dict(live_pos)
 
         now_ts = time.time()
@@ -875,6 +1125,7 @@ def _evaluate_shadow_positions():
             with state_lock:
                 if symbol in shadow_positions:
                     shadow_positions[symbol]["last_snapshot_log"] = now_ts
+                    _mark_state_dirty()
 
         if action == "EXIT":
             _close_shadow_position(symbol, pos, "DEPTH_EXIT", ltp, action_reason)
@@ -903,6 +1154,7 @@ def _cancel_pending_eod():
             return
         cancelled = list(pending.keys())
         pending.clear()
+        _mark_state_dirty()
     _append_event("baseline", "pending_cleared_eod", {"symbols": cancelled})
 
 
@@ -917,24 +1169,34 @@ def watchdog():
                 _evaluate_pending(symbol)
             _evaluate_positions()
             _evaluate_shadow_positions()
+            _save_runtime_state()
         except Exception as exc:
             log.error("Watchdog error: %s", exc, exc_info=True)
             _append_event("shadow", "watchdog_error", {"message": str(exc)})
+            _save_runtime_state(force=True)
         time.sleep(1)
 
 
 def _bootstrap_runtime():
     global watchdog_started
+    _init_event_db()
     _load_master()
+    _load_runtime_state()
+    _load_recent_shadow_events()
+    _prune_all_pools()
     depth_manager.start()
-    depth_manager.ensure_symbols(master)
+    depth_manager.ensure_symbols(list(set(master) | set(positions.keys()) | set(shadow_positions.keys()) | set(pending.keys())))
 
     if watchdog_started:
         return
 
     threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
     watchdog_started = True
+    _save_runtime_state(force=True)
     log.info("Watchdog started. Mode=%s depth_shadow=%s", TRADING_MODE, DEPTH_SHADOW_ENABLED)
+
+
+atexit.register(lambda: _save_runtime_state(force=True))
 
 
 def _ingest_symbols(pool: dict[str, list[datetime]], label: str):
@@ -943,6 +1205,7 @@ def _ingest_symbols(pool: dict[str, list[datetime]], label: str):
     with state_lock:
         for symbol in symbols:
             pool.setdefault(symbol, []).append(now)
+        _mark_state_dirty()
     _prune_all_pools(now)
     depth_manager.ensure_symbols(symbols)
     _append_event("baseline", "scanner_ingest", {"label": label, "symbols": symbols})
@@ -991,6 +1254,9 @@ def dashboard():
             "depth_feed": depth_manager.status(),
             "depth_buffer": depth_manager.buffer.stats(),
             "log_dir": LOG_DIR,
+            "state_file": STATE_FILE,
+            "event_db_file": EVENT_DB_FILE,
+            "railway_volume_mount_path": os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),
         }
     )
 
