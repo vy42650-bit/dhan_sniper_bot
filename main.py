@@ -42,11 +42,24 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
 
 TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
-DEFAULT_LOG_DIR = os.path.join(
-    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.join(os.path.dirname(__file__), "runtime_logs")),
-    "runtime_logs",
-)
-LOG_DIR = os.getenv("LOG_DIR", DEFAULT_LOG_DIR)
+
+
+def _resolve_log_dir() -> tuple[str, str | None]:
+    explicit_log_dir = os.getenv("LOG_DIR")
+    if explicit_log_dir:
+        return explicit_log_dir, os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+
+    volume_root = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if not volume_root and os.path.isdir("/data"):
+        volume_root = "/data"
+
+    if volume_root:
+        return os.path.join(volume_root, "runtime_logs"), volume_root
+
+    return os.path.join(os.path.dirname(__file__), "runtime_logs"), None
+
+
+LOG_DIR, RAILWAY_VOLUME_ROOT = _resolve_log_dir()
 STATE_FILE = os.path.join(LOG_DIR, "runtime_state.json")
 EVENT_DB_FILE = os.path.join(LOG_DIR, "runtime_events.sqlite3")
 MAX_RECENT_SHADOW_EVENTS = 500
@@ -1256,7 +1269,7 @@ def dashboard():
             "log_dir": LOG_DIR,
             "state_file": STATE_FILE,
             "event_db_file": EVENT_DB_FILE,
-            "railway_volume_mount_path": os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),
+            "railway_volume_mount_path": RAILWAY_VOLUME_ROOT,
         }
     )
 
