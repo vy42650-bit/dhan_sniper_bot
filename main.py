@@ -362,20 +362,20 @@ def wh_buy():
     _rebuild_master()
     
     for s in stocks:
-        if s in master and s not in positions and s not in pending and len(positions) < MAX_SLOTS:
+        if s in master and s not in positions and len(positions) < MAX_SLOTS:
             candles = _get_1min_candles(s, n=10)
             if candles:
                 ema9 = _calculate_ema9(candles)
                 curr = candles[-1]["close"]
                 if ema9 and (curr - ema9)/ema9 <= EMA_GUARD_PCT:
-                    pending[s] = {"queued_at": datetime.now(), "signal_high": candles[-1]["high"], "signal_close": curr}
-                    log.info(f"QUEUED: {s} | Signal High: {candles[-1]['high']} | Close: {curr}")
+                    log.info(f"🎯 HIGH-CONVICTION SIGNAL VERIFIED: Executing Immediate Entry for {s} at {curr}")
+                    _execute_entry(s, curr)
                 else:
-                    log.info(f"REJECTED: {s} | Reason: EMA_EXTENDED or NO_EMA")
+                    log.info(f"REJECTED: {s} | Reason: EMA_EXTENDED (>4% above EMA9)")
             else:
                 log.info(f"SKIPPED: {s} | Reason: API_NO_CANDLES")
         else:
-            reason = "NOT_IN_MASTER_RANKING" if s not in master else "ALREADY_OPEN_OR_PENDING"
+            reason = "NOT_IN_MASTER_RANKING" if s not in master else "ALREADY_OPEN"
             log.info(f"SKIPPED: {s} | Reason: {reason}")
     return jsonify(status="ok")
 
