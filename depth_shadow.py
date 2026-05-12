@@ -324,6 +324,14 @@ class DepthFeedManager:
             "last_error": None,
             "subscribed_count": 0,
         }
+        self._feed_mode = self._resolve_feed_mode()
+
+    def _resolve_feed_mode(self):
+        for attr in ("Full", "Depth"):
+            mode = getattr(marketfeed, attr, None)
+            if mode is not None:
+                return mode
+        return None
 
     def start(self):
         if not self.enabled or self._thread is not None:
@@ -353,12 +361,21 @@ class DepthFeedManager:
 
     def _instrument_triplets(self, symbols: list[str]) -> list[tuple[int, str, int]]:
         triplets = []
+        if self._feed_mode is None:
+            return triplets
         for symbol in symbols:
             sec_id = self.security_resolver(symbol)
             if str(sec_id).isdigit():
-                triplets.append((1, str(sec_id), marketfeed.Full))
+                triplets.append((1, str(sec_id), self._feed_mode))
                 self._sid_to_symbol[int(sec_id)] = symbol
         return triplets
+
+    @staticmethod
+    def _is_supported_packet(packet: dict) -> bool:
+        packet_type = str(packet.get("type", "") or "").strip().lower()
+        if packet.get("depth"):
+            return True
+        return packet_type in {"full data", "depth data"}
 
     def _refresh_subscriptions(self):
         with self._lock:
@@ -407,6 +424,12 @@ class DepthFeedManager:
 
         while self._running:
             try:
+                if self._feed_mode is None:
+                    with self._lock:
+                        self._status["last_error"] = "No supported marketfeed mode found"
+                    time.sleep(5)
+                    continue
+
                 self._refresh_subscriptions()
                 if self._feed is None:
                     time.sleep(1)
@@ -415,7 +438,7 @@ class DepthFeedManager:
                 packet = self._feed.get_data()
                 if not isinstance(packet, dict):
                     continue
-                if packet.get("type") != "Full Data":
+                if not self._is_supported_packet(packet):
                     continue
 
                 sec_id = int(packet.get("security_id", 0) or 0)
