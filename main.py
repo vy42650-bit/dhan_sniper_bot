@@ -242,10 +242,22 @@ def _rebuild_master():
 
     list_1m = get_top_n(pool_1m, 15)
     list_3m = get_top_n(pool_3m, 20)
-    list_5m = get_top_n(pool_5m, 15)
     
-    # Selection: Master candidate pool built from verified top scanners to accommodate asynchronous network webhooks
-    master = list(set(list_1m) | set(list_3m) | set(list_5m))
+    # Combined universe of top 1m (15) and top 3m (20) candidates (max 35 stocks)
+    combined_35 = list(set(list_1m) | set(list_3m))
+    
+    # Rank candidates from combined_35 against pool_5m arrival frequencies
+    counts_5m = {}
+    for s in combined_35:
+        valid_t = [t for t in pool_5m.get(s, []) if t > cutoff]
+        if valid_t: counts_5m[s] = len(valid_t)
+    
+    if counts_5m:
+        _get_bulk_volumes(list(counts_5m.keys()))
+        sorted_5m = sorted(counts_5m.keys(), key=lambda x: (counts_5m[x], volumes.get(x, 0)), reverse=True)
+        master = sorted_5m[:15]
+    else:
+        master = combined_35[:15]
     
     _save_master()
     log.info(f"MASTER UPDATED ({len(master)}): {master}")
