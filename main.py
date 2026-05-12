@@ -65,22 +65,24 @@ def _load_master():
     except: pass
 
 # ── Dhan Clients ──────────────────────────────────────────────────────────────
+# DATA CLIENT (Main Token for real-time market data)
 try:
-    # DATA CLIENT (Main Token for real-time market data)
     dhan_data = dhanhq(MAIN_CLIENT_ID, MAIN_ACCESS_TOKEN)
-    
-    # ORDER CLIENT (Sandbox Token for simulated execution)
+    log.info("Dhan Data Client (Main Token) Initialized Successfully.")
+except Exception as e:
+    log.error(f"Dhan Data Client init failed: {e}")
+    dhan_data = None
+
+# ORDER CLIENT (Sandbox Token for simulated execution)
+try:
     dhan_orders = dhanhq(SANDBOX_CLIENT_ID, SANDBOX_ACCESS_TOKEN)
-    
-    # CRITICAL: Manually override to point to Sandbox API
     if hasattr(dhan_orders, 'dhan_http'):
         dhan_orders.dhan_http.base_url = "https://sandbox.dhan.co/v2"
-        
-    log.info("Dhan Hybrid Clients Initialized: Data (Main) | Orders (Sandbox)")
+    log.info("Dhan Orders Client (Sandbox Token) Initialized Successfully.")
 except Exception as e:
-    log.error(f"Dhan init failed: {e}")
-    dhan_data = None
+    log.error(f"Dhan Orders Client init failed: {e}")
     dhan_orders = None
+
 
 # ── Security Map ──────────────────────────────────────────────────────────────
 _SECURITY_MAP: dict = {}
@@ -111,6 +113,9 @@ def _get_ltp(symbol: str) -> float | None:
 
 def _get_1min_candles(symbol: str, n: int = 10) -> list | None:
     try:
+        if not dhan_data:
+            log.warning(f"Dhan Data Client offline. Skipping candles for {symbol}")
+            return None
         sec_id = _resolve_security_id(symbol)
         today = datetime.now().strftime("%Y-%m-%d")
         resp = dhan_data.intraday_minute_data(sec_id, "NSE_EQ", "EQUITY", today, today)
