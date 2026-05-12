@@ -1,171 +1,374 @@
-# DHAN SNIPER BOT v4.0 - STABLE PRODUCTION BUILD
-import os, logging, threading, time, csv, json
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
-from dhanhq import dhanhq
-import pandas as pd
+import itertools
+import json
+import logging
+import os
+import threading
+import time
+from collections import deque
+from datetime import datetime, time as dt_time, timedelta
+from zoneinfo import ZoneInfo
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+import pandas as pd
+from dhanhq import dhanhq
+from flask import Flask, jsonify, request
+
+from depth_shadow import (
+    CONFIG as DEPTH_CONFIG,
+    DepthFeedManager,
+    entry_gate,
+    rank_signal,
+    watchdog_tick,
+)
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# MAIN APP (For Market Data)
-MAIN_CLIENT_ID    = "1105120853"
-MAIN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4NTk3OTI2LCJpYXQiOjE3Nzg1MTE1MjYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA1MTIwODUzIn0.dFWhEopjMzjdrBOPbv1yXNzHJqn7AEDUy_Ett-e8TOKlWTgSaj0j_vaxsg9lFNnk0Veg2E_uYVvdpXRG1IuwYg"
+IST = ZoneInfo("Asia/Kolkata")
 
-# SANDBOX (For Order Execution)
-SANDBOX_CLIENT_ID    = "2605019607"
-SANDBOX_ACCESS_TOKEN = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJwYXJ0bmVySWQiOiIiLCJkaGFuQ2xpZW50SWQiOiIyNjA1MDE5NjA3Iiwid2ViaG9va1VybCI6IiIsImlzcyI6ImRoYW4iLCJleHAiOjE3Nzg1OTg2MjV9.51ENYq_S8LqRQdJ8QEGstmnZPa5zvxhxBofGEVqW3tkXLjnIkchHVmwial5HM7hkO5fA7YIeo1ZzuxMT9pbmsA"
+MAIN_CLIENT_ID = os.getenv("MAIN_CLIENT_ID", "1105120853")
+MAIN_ACCESS_TOKEN = os.getenv(
+    "MAIN_ACCESS_TOKEN",
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4Njk1OTE4LCJpYXQiOjE3Nzg2MDk1MTgsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA1MTIwODUzIn0.ryp89RF2HByisq6xld12NprBtOzYpNYQrkxen3Bdxq9zfvH8pJejPNd61ZJ-fxUaOP09w13dBIkbA9s6up6LgA",
+)
+SANDBOX_CLIENT_ID = os.getenv("SANDBOX_CLIENT_ID", "2605019607")
+SANDBOX_ACCESS_TOKEN = os.getenv(
+    "SANDBOX_ACCESS_TOKEN",
+    "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJwYXJ0bmVySWQiOiIiLCJkaGFuQ2xpZW50SWQiOiIyNjA1MDE5NjA3Iiwid2ViaG9va1VybCI6IiIsImlzcyI6ImRoYW4iLCJleHAiOjE3Nzg1OTg2MjV9.51ENYq_S8LqRQdJ8QEGstmnZPa5zvxhxBofGEVqW3tkXLjnIkchHVmwial5HM7hkO5fA7YIeo1ZzuxMT9pbmsA",
+)
 
-TRADING_MODE = os.getenv("TRADING_MODE", "SANDBOX")  # SANDBOX | LIVE
+TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
+DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
+LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.dirname(__file__), "runtime_logs"))
 
-# ── Strategy Constants ────────────────────────────────────────────────────────
-BLACKLIST          = {"MEESHO", "MEESHO-BE"}
-MAX_SLOTS          = 8
-SL_PCT             = 0.013    # 1.3% hard stop
-TSL_TRIGGER_PCT    = 0.020    # 2.0% trigger
-TSL_TRAIL_PCT      = 0.020    # 2.0% trail
-TIME_EXIT_MINS     = 45
-ROLLING_WINDOW     = 25       
-REFRESH_MINS       = 5        
-TOP_1M             = 15
-TOP_3M             = 25
-SLOT_CAPITAL       = 50000
-MAX_RED_CANDLE_PCT = 0.008    # 0.8% healthy dip
-EXHAUSTION_MULT    = 3.0
-SMART_ENTRY_MINS   = 3
-EMA_GUARD_PCT      = 0.04     # Reject if >4% above EMA9
-
-# ── State ─────────────────────────────────────────────────────────────────────
-pool_1m:   dict = {}   # {sym: [timestamps]}
-pool_3m:   dict = {}   # {sym: [timestamps]}
-pool_5m:   dict = {}   # {sym: [timestamps]}
-volumes:   dict = {}   # {sym: absolute_volume}
-master:    list = []
-positions: dict = {}
-pending:   dict = {}
-trades_today: list = []
-
+BLACKLIST = {"MEESHO", "MEESHO-BE"}
+MAX_SLOTS = 8
+SLOT_CAPITAL = 50000
+ROLLING_WINDOW_MINS = 25
+TOP_1M = 15
+TOP_3M = 20
+MASTER_SIZE = 15
+SMART_ENTRY_MINS = 3
+MAX_RED_CANDLE_PCT = 0.008
+SL_PCT = 0.013
+TSL_TRIGGER_PCT = 0.020
+TSL_TRAIL_PCT = 0.020
+TIME_EXIT_MINS = 45
+WARMUP_END = dt_time(9, 40)
+EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
+SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
+
+pool_1m: dict[str, list[datetime]] = {}
+pool_3m: dict[str, list[datetime]] = {}
+pool_5m: dict[str, list[datetime]] = {}
+volumes: dict[str, int] = {}
+master: list[str] = []
+positions: dict[str, dict] = {}
+shadow_positions: dict[str, dict] = {}
+pending: dict[str, dict] = {}
+trades_today: list[dict] = []
+shadow_trades: list[dict] = []
+state_lock = threading.RLock()
+log_lock = threading.RLock()
+watchdog_started = False
+order_counter = itertools.count(1)
+shadow_recent_events = deque(maxlen=500)
+
+app = Flask(__name__)
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _now() -> datetime:
+    return datetime.now(IST)
+
+
+def _today_tag() -> str:
+    return _now().strftime("%Y%m%d")
+
+
+def _make_id(prefix: str) -> str:
+    return f"{prefix}_{_now().strftime('%Y%m%d_%H%M%S')}_{next(order_counter):05d}"
+
+
+def _append_event(stream: str, event_type: str, payload: dict):
+    event = {"ts": _now().isoformat(), "stream": stream, "event": event_type, **payload}
+    path = os.path.join(LOG_DIR, f"{stream}_{_today_tag()}.jsonl")
+    with log_lock:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, default=str) + "\n")
+    if stream == "shadow":
+        shadow_recent_events.append(event)
+    return event
+
+
+def _serialize_value(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _serialize_value(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_serialize_value(item) for item in value]
+    return value
+
+
+def _parse_candle_time(raw) -> datetime | None:
+    if raw in (None, "", 0):
+        return None
+
+    try:
+        if isinstance(raw, (int, float)):
+            ts = float(raw)
+            if ts > 1_000_000_000_000:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, IST)
+
+        if isinstance(raw, str):
+            txt = raw.strip().replace("Z", "+00:00")
+            if txt.isdigit():
+                return _parse_candle_time(int(txt))
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=IST)
+            return dt.astimezone(IST)
+    except Exception:
+        return None
+
+    return None
+
+
+def _parse_symbols_from_request() -> list[str]:
+    payload = request.get_json(silent=True) or {}
+    raw = payload.get("stocks", payload.get("symbol", []))
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+
+    symbols = []
+    seen = set()
+    for item in items:
+        symbol = str(item).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+    return symbols
+
 
 def _save_master():
     try:
-        with open(MASTER_FILE, "w") as f:
-            json.dump(master, f)
-    except: pass
+        with open(MASTER_FILE, "w", encoding="utf-8") as handle:
+            json.dump(master, handle)
+    except Exception as exc:
+        log.warning("Failed to save master list: %s", exc)
+
 
 def _load_master():
     global master
     try:
         if os.path.exists(MASTER_FILE):
-            with open(MASTER_FILE, "r") as f:
-                master = json.load(f)
-            log.info(f"Restored Master List: {len(master)} stocks")
-    except: pass
+            with open(MASTER_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, list):
+                master = [str(item).upper() for item in data]
+                log.info("Restored master list with %s symbols.", len(master))
+    except Exception as exc:
+        log.warning("Failed to load master list: %s", exc)
 
-# ── Dhan Clients ──────────────────────────────────────────────────────────────
-# DATA CLIENT (Main Token for real-time market data)
+
 def _ensure_dhan_data():
     global dhan_data
     if dhan_data is None:
         try:
             dhan_data = dhanhq(client_id=MAIN_CLIENT_ID, access_token=MAIN_ACCESS_TOKEN)
-            log.info("Dhan Data Client initialized successfully via self-healing block.")
-        except Exception as e:
-            log.error(f"Dhan Data Client init failed: {e}", exc_info=True)
+            log.info("Dhan market data client initialized.")
+        except Exception as exc:
+            log.error("Dhan data client init failed: %s", exc, exc_info=True)
             dhan_data = None
+
 
 dhan_data = None
 _ensure_dhan_data()
 
-# ORDER CLIENT (Sandbox Token for simulated execution)
 try:
     dhan_orders = dhanhq(client_id=SANDBOX_CLIENT_ID, access_token=SANDBOX_ACCESS_TOKEN)
-    if hasattr(dhan_orders, 'dhan_http'):
+    if hasattr(dhan_orders, "dhan_http"):
         dhan_orders.dhan_http.base_url = "https://sandbox.dhan.co/v2"
-    log.info("Dhan Orders Client (Sandbox Token) Initialized Successfully.")
-except Exception as e:
-    log.error(f"Dhan Orders Client init failed: {e}", exc_info=True)
+    log.info("Dhan sandbox orders client initialized.")
+except Exception as exc:
+    log.warning("Dhan sandbox orders init failed: %s", exc)
     dhan_orders = None
 
 
-
-# ── Security Map ──────────────────────────────────────────────────────────────
-_SECURITY_MAP: dict = {}
+_SECURITY_MAP: dict[str, str] = {}
 try:
-    _map_path = os.path.join(os.path.dirname(__file__), "security_map.csv")
-    if os.path.exists(_map_path):
-        _df = pd.read_csv(_map_path, low_memory=False)
-        _eq = _df[_df["SEM_INSTRUMENT_NAME"] == "EQUITY"]
-        for _, row in _eq.iterrows():
+    map_path = os.path.join(os.path.dirname(__file__), "security_map.csv")
+    if os.path.exists(map_path):
+        df = pd.read_csv(map_path, low_memory=False)
+        df = df[df["SEM_INSTRUMENT_NAME"] == "EQUITY"]
+        for _, row in df.iterrows():
             _SECURITY_MAP[str(row["SEM_TRADING_SYMBOL"]).upper()] = str(row["SEM_SMST_SECURITY_ID"])
-        log.info(f"Security map loaded: {len(_SECURITY_MAP)} equity symbols")
-except Exception as e:
-    log.warning(f"Security map load failed: {e}")
+        log.info("Security map loaded with %s equity symbols.", len(_SECURITY_MAP))
+except Exception as exc:
+    log.warning("Security map load failed: %s", exc)
 
-app = Flask(__name__)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def _resolve_security_id(symbol: str) -> str:
     return _SECURITY_MAP.get(symbol.upper(), symbol)
 
-def _get_ltp(symbol: str) -> float | None:
-    try:
-        _ensure_dhan_data()
-        if dhan_data is None: return None
-        sec_id = _resolve_security_id(symbol)
-        if not sec_id.isdigit(): return None
-        resp = dhan_data.quote_data({"NSE_EQ": [int(sec_id)]})
-        if resp.get("status") == "success":
-            data_dict = resp["data"]["data"]["NSE_EQ"][str(sec_id)]
-            return float(data_dict["last_price"])
-    except Exception as e: pass
-    return None
 
-def _get_1min_candles(symbol: str, n: int = 10) -> list | None:
+depth_manager = DepthFeedManager(
+    client_id=MAIN_CLIENT_ID,
+    access_token=MAIN_ACCESS_TOKEN,
+    security_resolver=_resolve_security_id,
+    enabled=DEPTH_SHADOW_ENABLED,
+)
+
+
+def _get_quote_snapshot(symbol: str) -> dict | None:
     try:
         _ensure_dhan_data()
         if dhan_data is None:
-            log.warning(f"Dhan Data Client offline. Skipping candles for {symbol}")
             return None
+
         sec_id = _resolve_security_id(symbol)
-        today = datetime.now().strftime("%Y-%m-%d")
-        resp = dhan_data.intraday_minute_data(sec_id, "NSE_EQ", "EQUITY", today, today)
-        if resp.get("status") == "success" and resp.get("data"):
-            d = resp["data"]
-            ts_key = 'timestamp' if 'timestamp' in d else ('start_Time' if 'start_Time' in d else 'start_time')
-            l = len(d.get('close', []))
-            if l == 0: return None
-            
-            candles = []
-            for i in range(l):
-                candles.append({
-                    'open': d['open'][i], 'high': d['high'][i],
-                    'low': d['low'][i], 'close': d['close'][i],
-                    'volume': d.get('volume', [0]*l)[i],
-                    'time': d.get(ts_key, [0]*l)[i]
-                })
-            return candles[-n:]
-        else:
-            log.warning(f"Dhan Data API Error for {symbol}: {resp}")
-    except Exception as e: 
-        log.error(f"Dhan Data API Exception for {symbol}: {e}")
-    return None
+        if not str(sec_id).isdigit():
+            return None
 
-def _calculate_ema9(candles: list) -> float | None:
-    if len(candles) < 9: return None
-    closes = [c["close"] for c in candles]
-    k = 2 / (9 + 1)
-    ema = closes[0]
-    for price in closes[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
+        resp = dhan_data.quote_data({"NSE_EQ": [int(sec_id)]})
+        if resp.get("status") != "success":
+            return None
 
-def _place_order(symbol: str, qty: int, side: str):
-    log.info(f"PLACING {side} ORDER: {qty} x {symbol} (Target: SANDBOX)")
+        quote = resp["data"]["data"]["NSE_EQ"].get(str(sec_id), {})
+        quote["security_id"] = str(sec_id)
+        return quote
+    except Exception:
+        return None
+
+
+def _get_ltp(symbol: str) -> float | None:
+    quote = _get_quote_snapshot(symbol)
+    if not quote:
+        return None
+    last_price = quote.get("last_price")
+    return float(last_price) if last_price is not None else None
+
+
+def _get_bulk_volumes(symbols: list[str]):
+    _ensure_dhan_data()
+    if not symbols or dhan_data is None:
+        return
+
     try:
-        # We manually use the sandbox endpoint if needed, but usually the token determines it
+        unique = []
+        id_to_symbol = {}
+        seen = set()
+        for symbol in symbols:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            sec_id = _resolve_security_id(symbol)
+            if str(sec_id).isdigit():
+                unique.append(int(sec_id))
+                id_to_symbol[str(sec_id)] = symbol
+
+        for idx in range(0, len(unique), 25):
+            chunk = unique[idx:idx + 25]
+            resp = dhan_data.quote_data({"NSE_EQ": chunk})
+            if resp.get("status") != "success":
+                continue
+            quote_map = resp["data"]["data"]["NSE_EQ"]
+            for sec_id, quote in quote_map.items():
+                symbol = id_to_symbol.get(sec_id)
+                if symbol:
+                    volumes[symbol] = int(quote.get("volume", 0) or 0)
+    except Exception as exc:
+        log.warning("Bulk volume fetch failed: %s", exc)
+
+
+def _get_1min_candles(symbol: str, n: int = 35) -> list[dict] | None:
+    try:
+        _ensure_dhan_data()
+        if dhan_data is None:
+            return None
+
+        sec_id = _resolve_security_id(symbol)
+        if not str(sec_id).isdigit():
+            return None
+
+        today = _now().strftime("%Y-%m-%d")
+        resp = dhan_data.intraday_minute_data(sec_id, "NSE_EQ", "EQUITY", today, today)
+        if resp.get("status") != "success" or not resp.get("data"):
+            return None
+
+        data = resp["data"]
+        length = len(data.get("close", []))
+        if length == 0:
+            return None
+
+        ts_key = "timestamp"
+        if ts_key not in data:
+            ts_key = "start_Time" if "start_Time" in data else "start_time"
+
+        candles = []
+        for idx in range(length):
+            candles.append(
+                {
+                    "open": float(data["open"][idx]),
+                    "high": float(data["high"][idx]),
+                    "low": float(data["low"][idx]),
+                    "close": float(data["close"][idx]),
+                    "volume": int(data.get("volume", [0] * length)[idx] or 0),
+                    "time": data.get(ts_key, [0] * length)[idx],
+                }
+            )
+        return candles[-n:]
+    except Exception as exc:
+        log.warning("1m candle fetch failed for %s: %s", symbol, exc)
+        return None
+
+
+def _get_recent_30min_volume(symbol: str) -> int:
+    candles = _get_1min_candles(symbol, n=35)
+    if not candles:
+        return 0
+    return int(sum(candle.get("volume", 0) for candle in candles[-30:]))
+
+
+def _get_daily_turnover_cr(symbol: str, quote: dict | None = None) -> float:
+    quote = quote or _get_quote_snapshot(symbol)
+    if not quote:
+        return 0.0
+    volume = int(quote.get("volume", 0) or 0)
+    avg_price = float(quote.get("avg_price", 0) or 0)
+    last_price = float(quote.get("last_price", 0) or 0)
+    price = avg_price if avg_price > 0 else last_price
+    if price <= 0 or volume <= 0:
+        return 0.0
+    return round((price * volume) / 1e7, 2)
+
+
+def _place_order(symbol: str, qty: int, side: str, trade_id: str):
+    if TRADING_MODE == "PAPER":
+        return {
+            "status": "success",
+            "mode": "PAPER",
+            "orderId": _make_id("paper_order"),
+            "symbol": symbol,
+            "side": side,
+            "quantity": qty,
+            "trade_id": trade_id,
+            "placed_at": _now().isoformat(),
+        }
+
+    if dhan_orders is None:
+        return {"status": "error", "message": "sandbox client unavailable"}
+
+    try:
         return dhan_orders.place_order(
             security_id=_resolve_security_id(symbol),
             exchange_segment="NSE_EQ",
@@ -173,225 +376,698 @@ def _place_order(symbol: str, qty: int, side: str):
             quantity=qty,
             order_type="MARKET",
             product_type="INTRA",
-            price=0
+            price=0,
         )
-    except Exception as e:
-        log.error(f"Order Placement Failed for {symbol}: {e}")
-        return {"status": "error", "message": str(e)}
+    except Exception as exc:
+        log.error("Order placement failed for %s: %s", symbol, exc)
+        return {"status": "error", "message": str(exc)}
+
+
+def _prune_pool(pool: dict[str, list[datetime]], cutoff: datetime) -> dict[str, int]:
+    counts = {}
+    for symbol in list(pool.keys()):
+        valid = [stamp for stamp in pool[symbol] if stamp >= cutoff]
+        if valid:
+            pool[symbol] = valid
+            counts[symbol] = len(valid)
+        else:
+            pool.pop(symbol, None)
+    return counts
+
+
+def _prune_all_pools(now: datetime | None = None):
+    cutoff = (now or _now()) - timedelta(minutes=ROLLING_WINDOW_MINS)
+    with state_lock:
+        _prune_pool(pool_1m, cutoff)
+        _prune_pool(pool_3m, cutoff)
+        _prune_pool(pool_5m, cutoff)
+    return cutoff
+
+
+def _rank_with_volume(counts: dict[str, int], symbols: list[str], limit: int) -> list[str]:
+    if not symbols:
+        return []
+    _get_bulk_volumes(symbols)
+    return sorted(symbols, key=lambda symbol: (-counts.get(symbol, 0), -volumes.get(symbol, 0), symbol))[:limit]
+
+
+def _rebuild_master() -> list[str]:
+    global master
+
+    now = _now()
+    cutoff = now - timedelta(minutes=ROLLING_WINDOW_MINS)
+    with state_lock:
+        counts_1m = _prune_pool(pool_1m, cutoff)
+        counts_3m = _prune_pool(pool_3m, cutoff)
+        counts_5m = _prune_pool(pool_5m, cutoff)
+
+    top_1m = _rank_with_volume(counts_1m, list(counts_1m.keys()), TOP_1M)
+    top_3m = _rank_with_volume(counts_3m, list(counts_3m.keys()), TOP_3M)
+    combined = list(dict.fromkeys(top_1m + top_3m))
+    final_master = _rank_with_volume(counts_5m, combined, MASTER_SIZE)
+
+    with state_lock:
+        master = final_master
+        _save_master()
+
+    depth_manager.ensure_symbols(combined[:50])
+    log.info("MASTER UPDATED (%s): %s", len(final_master), final_master)
+    _append_event(
+        "baseline",
+        "master_rebuild",
+        {"top_1m": top_1m, "top_3m": top_3m, "combined": combined, "master": final_master},
+    )
+    return final_master
+
+
+def _is_market_warmup(now: datetime | None = None) -> bool:
+    current = (now or _now()).time()
+    return dt_time(9, 15) <= current < WARMUP_END
+
+
+def _is_eod(now: datetime | None = None) -> bool:
+    return (now or _now()).time() >= EOD_EXIT_TIME
+
+
+def _build_depth_context(symbol: str, signal_price: float) -> dict:
+    depth_now, depth_5s_ago, rolling = depth_manager.get(symbol)
+    quote = _get_quote_snapshot(symbol)
+    turnover_cr = _get_daily_turnover_cr(symbol, quote)
+    recent_30min_volume = _get_recent_30min_volume(symbol)
+    velocity = 0.0
+    gate_pass = False
+    gate_score = 0
+    gate_reason = "DEPTH_DISABLED"
+    rank_score = None
+    spread_pct = None
+
+    if DEPTH_SHADOW_ENABLED and depth_now and depth_now.get("buy") and depth_now.get("sell"):
+        best_bid = depth_now["buy"][0]["price"]
+        best_ask = depth_now["sell"][0]["price"]
+        if best_bid > 0:
+            spread_pct = (best_ask - best_bid) / best_bid
+        gate_pass, gate_score, gate_reason = entry_gate(
+            symbol=symbol,
+            signal_price=signal_price,
+            depth_now=depth_now,
+            depth_5s_ago=depth_5s_ago,
+            daily_turnover_cr=turnover_cr,
+            recent_30min_volume=recent_30min_volume,
+        )
+        rank_score = rank_signal(
+            symbol=symbol,
+            signal_price=signal_price,
+            gate_score=gate_score,
+            depth_now=depth_now,
+            depth_buffer_60s=rolling,
+            recent_30min_volume=recent_30min_volume,
+        )
+        from depth_shadow import compute_book_velocity
+
+        velocity = compute_book_velocity(rolling)
+    elif DEPTH_SHADOW_ENABLED:
+        gate_reason = "NO_DEPTH_DATA"
+
+    return {
+        "depth_now": depth_now,
+        "depth_5s_ago": depth_5s_ago,
+        "rolling_60s_len": len(rolling),
+        "quote": quote,
+        "turnover_cr": turnover_cr,
+        "recent_30min_volume": recent_30min_volume,
+        "gate_pass": gate_pass,
+        "gate_score": gate_score,
+        "gate_reason": gate_reason,
+        "rank_score": rank_score,
+        "velocity": velocity,
+        "spread_pct": spread_pct,
+    }
+
+
+def _queue_signal(symbol: str) -> bool:
+    candles = _get_1min_candles(symbol, n=5)
+    if not candles:
+        log.info("QUEUE SKIPPED %s | reason=NO_1M_DATA", symbol)
+        return False
+
+    signal_candle = candles[-1]
+    signal_time = _parse_candle_time(signal_candle.get("time")) or _now()
+    queued_at = _now()
+    depth_manager.ensure_symbols([symbol])
+
+    depth_ctx = _build_depth_context(symbol, float(signal_candle["close"]))
+    _append_event(
+        "shadow",
+        "signal_observed",
+        {
+            "symbol": symbol,
+            "signal_high": float(signal_candle["high"]),
+            "signal_close": float(signal_candle["close"]),
+            "queued_at": queued_at.isoformat(),
+            "depth": _serialize_value(depth_ctx),
+        },
+    )
+
+    with state_lock:
+        pending[symbol] = {
+            "queued_at": queued_at,
+            "expires_at": queued_at + timedelta(minutes=SMART_ENTRY_MINS),
+            "signal_high": float(signal_candle["high"]),
+            "signal_close": float(signal_candle["close"]),
+            "signal_candle_time": signal_time,
+            "last_candle_check": signal_time,
+            "signal_payload": {"high": float(signal_candle["high"]), "close": float(signal_candle["close"])},
+            "depth_signal_ctx": depth_ctx,
+        }
+
+    _append_event(
+        "baseline",
+        "pending_queued",
+        {
+            "symbol": symbol,
+            "signal_high": float(signal_candle["high"]),
+            "signal_close": float(signal_candle["close"]),
+            "expires_at": (queued_at + timedelta(minutes=SMART_ENTRY_MINS)).isoformat(),
+        },
+    )
+    return True
+
+
+def _extract_healthy_dip(symbol: str, meta: dict) -> dict | None:
+    candles = _get_1min_candles(symbol, n=6)
+    if not candles:
+        return None
+
+    last_seen = meta.get("last_candle_check") or meta.get("signal_candle_time")
+    newest_seen = last_seen
+    for candle in candles:
+        candle_time = _parse_candle_time(candle.get("time"))
+        if candle_time is None:
+            continue
+
+        if newest_seen is None or candle_time > newest_seen:
+            newest_seen = candle_time
+
+        if last_seen and candle_time <= last_seen:
+            continue
+        if candle_time > meta["expires_at"]:
+            continue
+
+        open_price = float(candle["open"])
+        close_price = float(candle["close"])
+        if open_price <= 0 or close_price >= open_price:
+            continue
+
+        dip_pct = (open_price - close_price) / open_price
+        if dip_pct <= MAX_RED_CANDLE_PCT:
+            with state_lock:
+                if symbol in pending:
+                    pending[symbol]["last_candle_check"] = newest_seen
+            return {"entry_price": close_price, "dip_pct": dip_pct, "candle_time": candle_time}
+
+    with state_lock:
+        if symbol in pending:
+            pending[symbol]["last_candle_check"] = newest_seen
+    return None
+
+
+def _open_shadow_position(symbol: str, price: float, qty: int, trigger: str, baseline_trade_id: str):
+    depth_ctx = _build_depth_context(symbol, price)
+    payload = {
+        "symbol": symbol,
+        "baseline_trade_id": baseline_trade_id,
+        "entry_price": round(price, 2),
+        "trigger": trigger,
+        "depth": _serialize_value(depth_ctx),
+    }
+
+    if not depth_ctx["gate_pass"]:
+        _append_event("shadow", "entry_rejected", payload | {"reason": depth_ctx["gate_reason"]})
+        return
+
+    shadow_trade_id = _make_id("shadow_trade")
+    entry_time = _now()
+    with state_lock:
+        shadow_positions[symbol] = {
+            "trade_id": shadow_trade_id,
+            "baseline_trade_id": baseline_trade_id,
+            "entry": price,
+            "entry_time": entry_time,
+            "peak": price,
+            "hard_sl": round(price * (1 - SL_PCT), 2),
+            "sl": round(price * (1 - SL_PCT), 2),
+            "tsl_on": False,
+            "qty": qty,
+            "trigger": trigger,
+            "recent_30min_volume": depth_ctx["recent_30min_volume"],
+            "gate_score": depth_ctx["gate_score"],
+            "gate_reason": depth_ctx["gate_reason"],
+            "rank_score": depth_ctx["rank_score"],
+            "neg_velocity_since": None,
+            "wall_timers": {},
+            "last_snapshot_log": 0.0,
+        }
+
+    _append_event("shadow", "entry_opened", payload | {"shadow_trade_id": shadow_trade_id})
+
+
+def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
+    with state_lock:
+        if symbol in positions:
+            pending.pop(symbol, None)
+            return False
+        if len(positions) >= MAX_SLOTS:
+            return False
+
+    trade_id = _make_id("base_trade")
+    qty = max(1, int(SLOT_CAPITAL / price))
+    order_resp = _place_order(symbol, qty, "BUY", trade_id)
+    status = str(order_resp.get("status", "")).lower() if isinstance(order_resp, dict) else ""
+    accepted = status not in {"error", "failure", "rejected"}
+    if not accepted:
+        with state_lock:
+            pending.pop(symbol, None)
+        log.error("ENTRY FAILED %s | response=%s", symbol, order_resp)
+        return False
+
+    entry_time = _now()
+    with state_lock:
+        pending.pop(symbol, None)
+        positions[symbol] = {
+            "trade_id": trade_id,
+            "entry": price,
+            "entry_time": entry_time,
+            "peak": price,
+            "hard_sl": round(price * (1 - SL_PCT), 2),
+            "sl": round(price * (1 - SL_PCT), 2),
+            "tsl_on": False,
+            "qty": qty,
+            "trigger": trigger,
+            "order": order_resp,
+        }
+
+    _append_event(
+        "baseline",
+        "entry_opened",
+        {
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "entry_price": round(price, 2),
+            "qty": qty,
+            "trigger": trigger,
+            "mode": TRADING_MODE,
+        },
+    )
+    _open_shadow_position(symbol, price, qty, trigger, trade_id)
+    return True
+
+
+def _close_shadow_position(symbol: str, pos: dict, reason: str, exit_price: float, depth_reason: str | None = None):
+    pnl_rs = ((exit_price - pos["entry"]) / pos["entry"]) * SLOT_CAPITAL
+    trade = {
+        "trade_id": pos["trade_id"],
+        "baseline_trade_id": pos["baseline_trade_id"],
+        "symbol": symbol,
+        "entry_p": round(pos["entry"], 2),
+        "exit_p": round(exit_price, 2),
+        "reason": reason,
+        "depth_reason": depth_reason,
+        "gate_score": pos.get("gate_score"),
+        "rank_score": pos.get("rank_score"),
+        "pnl_rs": round(pnl_rs, 2),
+        "entry_time": pos["entry_time"].isoformat(),
+        "exit_time": _now().isoformat(),
+    }
+    with state_lock:
+        shadow_positions.pop(symbol, None)
+        shadow_trades.append(trade)
+    _append_event("shadow", "exit_closed", trade)
+
 
 def _exit(symbol: str, pos: dict, reason: str, exit_price: float):
+    order_resp = _place_order(symbol, pos["qty"], "SELL", pos["trade_id"])
     pnl_rs = ((exit_price - pos["entry"]) / pos["entry"]) * SLOT_CAPITAL
-    log.info(f"EXIT {symbol} {reason} P/L: Rs.{pnl_rs:+.2f}")
-    _place_order(symbol, pos["qty"], "SELL")
-    trades_today.append({
-        "symbol": symbol, "entry_p": pos["entry"], "exit_p": round(exit_price, 2),
-        "reason": reason, "pnl_rs": round(pnl_rs, 2), "time": datetime.now().strftime("%H:%M:%S")
-    })
-    positions.pop(symbol, None)
+    trade = {
+        "trade_id": pos["trade_id"],
+        "symbol": symbol,
+        "entry_p": round(pos["entry"], 2),
+        "exit_p": round(exit_price, 2),
+        "reason": reason,
+        "trigger": pos.get("trigger"),
+        "pnl_rs": round(pnl_rs, 2),
+        "entry_time": pos["entry_time"].isoformat(),
+        "exit_time": _now().isoformat(),
+        "order": order_resp,
+    }
+    with state_lock:
+        positions.pop(symbol, None)
+        trades_today.append(trade)
+    _append_event("baseline", "exit_closed", trade)
 
-# ── Core Engine ───────────────────────────────────────────────────────────────
-def _get_bulk_volumes(symbols: list):
-    _ensure_dhan_data()
-    if not symbols or dhan_data is None: return
-    try:
-        sec_ids = []
-        id_to_sym = {}
-        for s in symbols:
-            if s not in volumes:
-                sid = _resolve_security_id(s)
-                if sid.isdigit():
-                    sec_ids.append(int(sid))
-                    id_to_sym[str(sid)] = s
-        
-        if sec_ids:
-            for i in range(0, len(sec_ids), 25):
-                chunk = sec_ids[i:i+25]
-                resp = dhan_data.quote_data({"NSE_EQ": chunk})
-                if resp.get("status") == "success":
-                    data_map = resp["data"]["data"]["NSE_EQ"]
-                    for sid_str, data_dict in data_map.items():
-                        sym = id_to_sym.get(sid_str)
-                        if sym: volumes[sym] = int(data_dict.get("volume", 0))
-    except: pass
 
-def _rebuild_master():
-    global master
-    now = datetime.now()
-    cutoff = now - timedelta(minutes=ROLLING_WINDOW)
-    
-    def get_top_n(pool, limit):
-        # Filter by time and count frequencies
-        counts = {}
-        # Iterate over a copy of keys to safely prune pool in-place
-        for s in list(pool.keys()):
-            valid_t = [t for t in pool[s] if t > cutoff]
-            if valid_t:
-                pool[s] = valid_t # Prune pool keeping valid timestamps
-                counts[s] = len(valid_t)
-            else:
-                pool.pop(s, None)
-            
-        if not counts: return []
-        
-        # Get volumes for all candidates to break ties
-        _get_bulk_volumes(list(counts.keys()))
-        
-        # Sort by (frequency, volume)
-        sorted_stocks = sorted(counts.keys(), key=lambda x: (counts[x], volumes.get(x, 0)), reverse=True)
-        return sorted_stocks[:limit]
+def _evaluate_pending(symbol: str):
+    with state_lock:
+        meta = pending.get(symbol)
+        current_positions = len(positions)
 
-    list_1m = get_top_n(pool_1m, 15)
-    list_3m = get_top_n(pool_3m, 20)
-    
-    # Combined universe of top 1m (15) and top 3m (20) candidates (max 35 stocks)
-    combined_35 = list(set(list_1m) | set(list_3m))
-    
-    # Rank candidates from combined_35 against pool_5m arrival frequencies
-    counts_5m = {}
-    for s in combined_35:
-        valid_t = [t for t in pool_5m.get(s, []) if t > cutoff]
-        if valid_t: counts_5m[s] = len(valid_t)
-    
-    if counts_5m:
-        _get_bulk_volumes(list(counts_5m.keys()))
-        sorted_5m = sorted(counts_5m.keys(), key=lambda x: (counts_5m[x], volumes.get(x, 0)), reverse=True)
-        master = sorted_5m[:15]
-    else:
-        master = combined_35[:15]
-    
-    _save_master()
-    log.info(f"MASTER UPDATED ({len(master)}): {master}")
+    if not meta:
+        return
 
-def _evaluate_smart_entry(symbol: str):
-    meta = pending.get(symbol)
-    if not meta: return
-    if (datetime.now() - meta["queued_at"]).total_seconds() / 60 >= SMART_ENTRY_MINS:
-        log.info(f"PENDING EXPIRED: {symbol} exceeded 3-minute entry window.")
-        pending.pop(symbol, None); return
-    if len(positions) >= MAX_SLOTS: return
+    now = _now()
+    if now >= meta["expires_at"]:
+        with state_lock:
+            pending.pop(symbol, None)
+        _append_event("baseline", "pending_expired", {"symbol": symbol})
+        return
+
+    if current_positions >= MAX_SLOTS:
+        return
 
     ltp = _get_ltp(symbol)
-    if not ltp: return
-    
-    # Breakout entry logic: if live price crosses signal high
-    if ltp > meta["signal_high"]:
-        log.info(f"🚀 BREAKOUT ENTRY TRIGGERED for {symbol} at {ltp} (Signal High: {meta['signal_high']})")
-        _execute_entry(symbol, ltp)
-    # Healthy dip entry logic: if live price dips below signal close but stays within max dip limit
-    elif ltp < meta["signal_close"]:
-        dip_pct = (meta["signal_close"] - ltp) / meta["signal_close"]
-        if dip_pct <= MAX_RED_CANDLE_PCT:
-            log.info(f"📉 HEALTHY DIP ENTRY TRIGGERED for {symbol} at {ltp} (Dip: {dip_pct*100:.2f}%)")
-            _execute_entry(symbol, ltp)
+    if ltp is not None and ltp > meta["signal_high"]:
+        _execute_entry(symbol, ltp, "BREAKOUT")
+        return
 
-def _execute_entry(symbol: str, price: float):
-    pending.pop(symbol, None)
-    qty = max(1, int(SLOT_CAPITAL / price))
-    _place_order(symbol, qty, "BUY")
-    positions[symbol] = {
-        "entry": price, "entry_time": datetime.now(), "peak": price,
-        "sl": round(price * (1 - SL_PCT), 2), "tsl_on": False, "qty": qty
-    }
+    healthy_dip = _extract_healthy_dip(symbol, meta)
+    if healthy_dip:
+        _append_event(
+            "baseline",
+            "healthy_dip_detected",
+            {
+                "symbol": symbol,
+                "dip_pct": round(healthy_dip["dip_pct"] * 100, 3),
+                "candle_time": healthy_dip["candle_time"].isoformat(),
+            },
+        )
+        _execute_entry(symbol, healthy_dip["entry_price"], "HEALTHY_DIP")
+
+
+def _evaluate_positions():
+    with state_lock:
+        snapshot = [(symbol, dict(pos)) for symbol, pos in positions.items()]
+
+    now = _now()
+    eod = _is_eod(now)
+    for symbol, pos in snapshot:
+        ltp = _get_ltp(symbol)
+        if ltp is None:
+            continue
+
+        if ltp > pos["peak"]:
+            pos["peak"] = ltp
+        if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + TSL_TRIGGER_PCT):
+            pos["tsl_on"] = True
+        if pos["tsl_on"]:
+            trailing_floor = pos["peak"] * (1 - TSL_TRAIL_PCT)
+            if trailing_floor > pos["sl"]:
+                pos["sl"] = round(trailing_floor, 2)
+
+        with state_lock:
+            live_pos = positions.get(symbol)
+            if live_pos is None:
+                continue
+            live_pos["peak"] = pos["peak"]
+            live_pos["tsl_on"] = pos["tsl_on"]
+            live_pos["sl"] = pos["sl"]
+            pos = dict(live_pos)
+
+        reason = None
+        if eod:
+            reason = "EOD_EXIT"
+        elif ltp <= pos["hard_sl"]:
+            reason = "SL_HIT"
+        elif ltp <= pos["sl"] and pos["tsl_on"]:
+            reason = "TSL_HIT"
+        elif (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
+            reason = "TIME_EXIT"
+
+        if reason:
+            _exit(symbol, pos, reason, ltp)
+
+
+def _evaluate_shadow_positions():
+    with state_lock:
+        snapshot = [(symbol, dict(pos)) for symbol, pos in shadow_positions.items()]
+
+    now = _now()
+    eod = _is_eod(now)
+    for symbol, pos in snapshot:
+        ltp = _get_ltp(symbol)
+        depth_now, _, rolling = depth_manager.get(symbol)
+        action = "CONTINUE"
+        action_reason = "NO_DEPTH"
+
+        if depth_now:
+            position_ctx = {
+                "entry_price": pos["entry"],
+                "peak_price": pos["peak"],
+                "symbol": symbol,
+                "neg_velocity_since": pos.get("neg_velocity_since"),
+            }
+            action, action_reason = watchdog_tick(
+                position=position_ctx,
+                depth_now=depth_now,
+                depth_buffer_60s=rolling,
+                wall_timers=pos.get("wall_timers", {}),
+                recent_30min_volume=pos.get("recent_30min_volume", 0),
+            )
+            pos["neg_velocity_since"] = position_ctx.get("neg_velocity_since")
+
+        if ltp is None:
+            continue
+
+        if ltp > pos["peak"]:
+            pos["peak"] = ltp
+        if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + TSL_TRIGGER_PCT):
+            pos["tsl_on"] = True
+        if pos["tsl_on"]:
+            trailing_floor = pos["peak"] * (1 - TSL_TRAIL_PCT)
+            if trailing_floor > pos["sl"]:
+                pos["sl"] = round(trailing_floor, 2)
+
+        with state_lock:
+            live_pos = shadow_positions.get(symbol)
+            if live_pos is None:
+                continue
+            live_pos["peak"] = pos["peak"]
+            live_pos["tsl_on"] = pos["tsl_on"]
+            live_pos["sl"] = pos["sl"]
+            live_pos["neg_velocity_since"] = pos.get("neg_velocity_since")
+            pos = dict(live_pos)
+
+        now_ts = time.time()
+        if now_ts - pos.get("last_snapshot_log", 0.0) >= SHADOW_SNAPSHOT_LOG_SECS:
+            _append_event(
+                "shadow",
+                "position_snapshot",
+                {
+                    "trade_id": pos["trade_id"],
+                    "symbol": symbol,
+                    "ltp": round(ltp, 2),
+                    "peak": round(pos["peak"], 2),
+                    "sl": round(pos["sl"], 2),
+                    "tsl_on": pos["tsl_on"],
+                    "depth_action": action,
+                    "depth_reason": action_reason,
+                    "buffer_len": len(rolling),
+                },
+            )
+            with state_lock:
+                if symbol in shadow_positions:
+                    shadow_positions[symbol]["last_snapshot_log"] = now_ts
+
+        if action == "EXIT":
+            _close_shadow_position(symbol, pos, "DEPTH_EXIT", ltp, action_reason)
+            continue
+
+        reason = None
+        if eod:
+            reason = "EOD_EXIT"
+        elif ltp <= pos["hard_sl"]:
+            reason = "SL_HIT"
+        elif action != "HOLD" and ltp <= pos["sl"] and pos["tsl_on"]:
+            reason = "TSL_HIT"
+        elif action != "HOLD" and (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
+            reason = "TIME_EXIT"
+
+        if reason:
+            _close_shadow_position(symbol, pos, reason, ltp, action_reason)
+
+
+def _cancel_pending_eod():
+    if not _is_eod():
+        return
+
+    with state_lock:
+        if not pending:
+            return
+        cancelled = list(pending.keys())
+        pending.clear()
+    _append_event("baseline", "pending_cleared_eod", {"symbols": cancelled})
+
 
 def watchdog():
     while True:
         try:
-            now = datetime.now()
-            # Use list() to create a copy of keys so we can mutate dictionaries safely during iteration
-            for sym in list(pending.keys()): _evaluate_smart_entry(sym)
-            for sym in list(positions.keys()):
-                if sym not in positions: continue
-                pos = positions[sym]
-                # Avoid calling live quote API continuously in loops if data client supports quote
-                # Or retrieve quote safely. Let's ensure _get_ltp works correctly.
-                ltp = _get_ltp(sym)
-                if not ltp: continue
-                if ltp > pos["peak"]: pos["peak"] = ltp
-                if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + TSL_TRIGGER_PCT):
-                    pos["tsl_on"] = True
-                    log.info(f"TSL ACTIVATED for {sym} at {ltp}")
-                if pos["tsl_on"]:
-                    floor = pos["peak"] * (1 - TSL_TRAIL_PCT)
-                    if floor > pos["sl"]: pos["sl"] = round(floor, 2)
-                
-                reason = None
-                if ltp <= pos["sl"]: reason = "SL_HIT"
-                elif (now - pos["entry_time"]).total_seconds() / 60 >= TIME_EXIT_MINS: reason = "TIME_EXIT"
-                if reason: _exit(sym, pos, reason, ltp)
-        except Exception as e: log.error(f"Watchdog error: {e}")
+            _prune_all_pools()
+            _cancel_pending_eod()
+            with state_lock:
+                pending_symbols = list(pending.keys())
+            for symbol in pending_symbols:
+                _evaluate_pending(symbol)
+            _evaluate_positions()
+            _evaluate_shadow_positions()
+        except Exception as exc:
+            log.error("Watchdog error: %s", exc, exc_info=True)
+            _append_event("shadow", "watchdog_error", {"message": str(exc)})
         time.sleep(1)
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+def _bootstrap_runtime():
+    global watchdog_started
+    _load_master()
+    depth_manager.start()
+    depth_manager.ensure_symbols(master)
+
+    if watchdog_started:
+        return
+
+    threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
+    watchdog_started = True
+    log.info("Watchdog started. Mode=%s depth_shadow=%s", TRADING_MODE, DEPTH_SHADOW_ENABLED)
+
+
+def _ingest_symbols(pool: dict[str, list[datetime]], label: str):
+    symbols = _parse_symbols_from_request()
+    now = _now()
+    with state_lock:
+        for symbol in symbols:
+            pool.setdefault(symbol, []).append(now)
+    _prune_all_pools(now)
+    depth_manager.ensure_symbols(symbols)
+    _append_event("baseline", "scanner_ingest", {"label": label, "symbols": symbols})
+    return symbols
+
+
 @app.get("/")
 def dashboard():
-    safe_pos = {}
-    for sym, p in positions.items():
-        safe_pos[sym] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in p.items()}
-    return jsonify({
-        "status": "ONLINE", "mode": TRADING_MODE, "master": master,
-        "positions": safe_pos, "pending": list(pending.keys()),
-        "pools": {"1m": len(pool_1m), "3m": len(pool_3m), "5m": len(pool_5m)},
-        "trades": trades_today, "total_pnl": round(sum(t["pnl_rs"] for t in trades_today), 2)
-    })
+    with state_lock:
+        baseline_positions = _serialize_value(positions)
+        baseline_trades = _serialize_value(trades_today[-30:])
+        shadow_open = _serialize_value(shadow_positions)
+        shadow_closed = _serialize_value(shadow_trades[-30:])
+        pending_view = _serialize_value(pending)
+        master_view = list(master)
+        pools = {
+            "1m": sum(len(stamps) for stamps in pool_1m.values()),
+            "3m": sum(len(stamps) for stamps in pool_3m.values()),
+            "5m": sum(len(stamps) for stamps in pool_5m.values()),
+        }
+
+    return jsonify(
+        {
+            "status": "ONLINE",
+            "mode": TRADING_MODE,
+            "depth_shadow_enabled": DEPTH_SHADOW_ENABLED,
+            "now_ist": _now().isoformat(),
+            "master": master_view,
+            "pending": pending_view,
+            "positions": baseline_positions,
+            "shadow_positions": shadow_open,
+            "pools": pools,
+            "baseline": {
+                "open_count": len(baseline_positions),
+                "trade_count": len(trades_today),
+                "total_pnl": round(sum(trade["pnl_rs"] for trade in trades_today), 2),
+                "recent_trades": baseline_trades,
+            },
+            "shadow": {
+                "open_count": len(shadow_open),
+                "trade_count": len(shadow_trades),
+                "total_pnl": round(sum(trade["pnl_rs"] for trade in shadow_trades), 2),
+                "recent_trades": shadow_closed,
+                "recent_events": list(shadow_recent_events)[-50:],
+            },
+            "depth_feed": depth_manager.status(),
+            "depth_buffer": depth_manager.buffer.stats(),
+            "log_dir": LOG_DIR,
+        }
+    )
+
+
+@app.get("/shadow")
+def shadow_dashboard():
+    with state_lock:
+        payload = {
+            "open_positions": _serialize_value(shadow_positions),
+            "closed_trades": _serialize_value(shadow_trades[-100:]),
+            "recent_events": list(shadow_recent_events),
+            "depth_feed": depth_manager.status(),
+        }
+    return jsonify(payload)
+
 
 @app.post("/webhook/1min")
 def wh1():
-    stocks = [s.strip().upper() for s in request.get_json(silent=True).get("stocks", "").split(",") if s]
-    log.info(f"[WH-1m] Received: {stocks}")
-    for s in stocks:
-        pool_1m.setdefault(s, []).append(datetime.now())
+    _ingest_symbols(pool_1m, "WH-1m")
     return jsonify(status="ok")
+
 
 @app.post("/webhook/3min")
 def wh3():
-    stocks = [s.strip().upper() for s in request.get_json(silent=True).get("stocks", "").split(",") if s]
-    log.info(f"[WH-3m] Received: {stocks}")
-    for s in stocks:
-        pool_3m.setdefault(s, []).append(datetime.now())
+    _ingest_symbols(pool_3m, "WH-3m")
     return jsonify(status="ok")
+
 
 @app.post("/webhook/5min")
 def wh5():
-    stocks = [s.strip().upper() for s in request.get_json(silent=True).get("stocks", "").split(",") if s]
-    log.info(f"[WH-5m] Received: {stocks}")
-    now = datetime.now()
-    for s in stocks:
-        pool_5m.setdefault(s, []).append(now)
+    _ingest_symbols(pool_5m, "WH-5m")
+    _rebuild_master()
     return jsonify(status="ok")
+
 
 @app.post("/webhook/final_buy")
 def wh_buy():
-    # 09:15 - 09:40 Warm-up block
-    now = datetime.now()
-    if now.hour == 9 and now.minute < 40:
-        log.info("WARM-UP: Signal received but skipping trades until 09:40")
-        return jsonify(status="warmup")
+    now = _now()
+    symbols = _parse_symbols_from_request()
+    if _is_market_warmup(now):
+        _append_event("baseline", "warmup_bypass", {"symbols": symbols})
+        return jsonify(status="warmup", skipped=symbols)
 
-    stocks = [s.strip().upper() for s in request.get_json(silent=True).get("stocks", "").split(",") if s]
-    log.info(f"[WH-BUY] Received signal for: {stocks}")
-    
-    # Rebuild master on every buy signal to ensure latest ranking
-    _rebuild_master()
-    
-    for s in stocks:
-        if s in master and s not in positions and len(positions) < MAX_SLOTS:
-            candles = _get_1min_candles(s, n=10)
-            if candles:
-                ema9 = _calculate_ema9(candles)
-                curr = candles[-1]["close"]
-                if ema9 and (curr - ema9)/ema9 <= EMA_GUARD_PCT:
-                    log.info(f"🎯 HIGH-CONVICTION SIGNAL VERIFIED: Executing Immediate Entry for {s} at {curr}")
-                    _execute_entry(s, curr)
-                else:
-                    log.info(f"REJECTED: {s} | Reason: EMA_EXTENDED (>4% above EMA9)")
-            else:
-                log.info(f"SKIPPED: {s} | Reason: API_NO_CANDLES")
+    latest_master = _rebuild_master()
+    queued = []
+    skipped = []
+    with state_lock:
+        open_symbols = set(positions.keys())
+        pending_symbols = set(pending.keys())
+
+    for symbol in symbols:
+        reason = None
+        if symbol in BLACKLIST:
+            reason = "BLACKLISTED"
+        elif symbol not in latest_master:
+            reason = "NOT_IN_MASTER"
+        elif symbol in open_symbols:
+            reason = "ALREADY_OPEN"
+        elif symbol in pending_symbols:
+            reason = "ALREADY_PENDING"
+        elif _is_eod(now):
+            reason = "EOD_BLOCK"
+
+        if reason:
+            skipped.append({"symbol": symbol, "reason": reason})
+            _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": reason})
+            continue
+
+        if _queue_signal(symbol):
+            queued.append(symbol)
         else:
-            reason = "NOT_IN_MASTER_RANKING" if s not in master else "ALREADY_OPEN"
-            log.info(f"SKIPPED: {s} | Reason: {reason}")
-    return jsonify(status="ok")
+            skipped.append({"symbol": symbol, "reason": "QUEUE_FAILED"})
+
+    return jsonify(status="ok", queued=queued, skipped=skipped)
+
+
+_bootstrap_runtime()
 
 if __name__ == "__main__":
-    _load_master()
-    threading.Thread(target=watchdog, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

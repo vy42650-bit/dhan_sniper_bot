@@ -1,0 +1,4 @@
+__pycache__/
+runtime_logs/
+master_list.json
+.env
