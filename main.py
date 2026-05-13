@@ -42,6 +42,7 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
 
 TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
+STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SUPREME_RUNNER_V2").upper()
 
 
 def _resolve_log_dir() -> tuple[str, str | None]:
@@ -84,10 +85,17 @@ WARMUP_END = dt_time(9, 40)
 EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
 SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
+RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "80"))
+RUNNER_MODE_SCORE = int(os.getenv("RUNNER_MODE_SCORE", "95"))
+RUNNER_STALL_MINS = int(os.getenv("RUNNER_STALL_MINS", "90"))
+RUNNER_STALL_PEAK_PCT = float(os.getenv("RUNNER_STALL_PEAK_PCT", "0.04"))
+RUNNER_TSL_TRIGGER_PCT = float(os.getenv("RUNNER_TSL_TRIGGER_PCT", "0.025"))
+RUNNER_TSL_TRAIL_PCT = float(os.getenv("RUNNER_TSL_TRAIL_PCT", "0.025"))
 
 pool_1m: dict[str, list[datetime]] = {}
 pool_3m: dict[str, list[datetime]] = {}
 pool_5m: dict[str, list[datetime]] = {}
+pool_buy: dict[str, list[datetime]] = {}
 volumes: dict[str, int] = {}
 master: list[str] = []
 positions: dict[str, dict] = {}
@@ -352,6 +360,7 @@ def _save_runtime_state(force: bool = False):
             "pool_1m": _pool_to_json(pool_1m),
             "pool_3m": _pool_to_json(pool_3m),
             "pool_5m": _pool_to_json(pool_5m),
+            "pool_buy": _pool_to_json(pool_buy),
             "volumes": dict(volumes),
             "positions": _serialize_value(positions),
             "shadow_positions": _serialize_value(shadow_positions),
@@ -392,6 +401,8 @@ def _load_runtime_state():
         pool_3m.update(_pool_from_json(payload.get("pool_3m") or {}))
         pool_5m.clear()
         pool_5m.update(_pool_from_json(payload.get("pool_5m") or {}))
+        pool_buy.clear()
+        pool_buy.update(_pool_from_json(payload.get("pool_buy") or {}))
 
         positions.clear()
         positions.update(
@@ -692,6 +703,7 @@ def _prune_all_pools(now: datetime | None = None):
         _prune_pool(pool_1m, cutoff)
         _prune_pool(pool_3m, cutoff)
         _prune_pool(pool_5m, cutoff)
+        _prune_pool(pool_buy, cutoff)
     return cutoff
 
 
@@ -730,6 +742,90 @@ def _rebuild_master() -> list[str]:
         {"top_1m": top_1m, "top_3m": top_3m, "combined": combined, "master": final_master},
     )
     return final_master
+
+
+def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int, dict]:
+    now = now or _now()
+    symbol = symbol.upper()
+    with state_lock:
+        cutoff = now - timedelta(minutes=ROLLING_WINDOW_MINS)
+        counts_1m = len([stamp for stamp in pool_1m.get(symbol, []) if stamp >= cutoff])
+        counts_3m = len([stamp for stamp in pool_3m.get(symbol, []) if stamp >= cutoff])
+        counts_5m = len([stamp for stamp in pool_5m.get(symbol, []) if stamp >= cutoff])
+        buy_count = len([stamp for stamp in pool_buy.get(symbol, []) if stamp >= cutoff])
+
+    quote = _get_quote_snapshot(symbol) or {}
+    ltp = float(quote.get("last_price", 0) or 0)
+    day_open = float((quote.get("ohlc") or {}).get("open", 0) or 0)
+    day_gain = ((ltp - day_open) / day_open) if day_open > 0 and ltp > 0 else 0.0
+
+    score = 0
+    score += min(30, counts_5m * 12)
+    score += min(25, counts_3m * 6)
+    score += min(20, counts_1m * 5)
+    score += min(20, buy_count * 8)
+    if day_gain >= 0.02:
+        score += 15
+    if day_gain >= 0.04:
+        score += 10
+
+    candles = []
+    rel_vol = 0.0
+    above_vwap = False
+    # Historical candles are rate-limited, so hydrate only plausible runner candidates.
+    if score >= 55:
+        candles = _get_1min_candles(symbol, n=40) or []
+    if ltp <= 0 and candles:
+        ltp = float(candles[-1]["close"])
+    if day_open <= 0 and candles:
+        day_open = float(candles[0]["open"])
+    if candles:
+        day_gain = ((ltp - day_open) / day_open) if day_open > 0 and ltp > 0 else day_gain
+        recent_10_vol = sum(int(candle.get("volume", 0) or 0) for candle in candles[-10:])
+        cumulative_vol = sum(int(candle.get("volume", 0) or 0) for candle in candles)
+        elapsed_mins = max(1, int((now - now.replace(hour=9, minute=15, second=0, microsecond=0)).total_seconds() // 60) + 1)
+        expected_10_vol = (cumulative_vol / elapsed_mins) * min(10, elapsed_mins) if cumulative_vol > 0 else 0
+        rel_vol = (recent_10_vol / expected_10_vol) if expected_10_vol > 0 else 0.0
+
+        pv_total = 0.0
+        vol_total = 0
+        for candle in candles:
+            volume = int(candle.get("volume", 0) or 0)
+            typical = (float(candle["high"]) + float(candle["low"]) + float(candle["close"])) / 3
+            pv_total += typical * volume
+            vol_total += volume
+        vwap = (pv_total / vol_total) if vol_total > 0 else None
+        above_vwap = bool(vwap and ltp >= vwap)
+        if above_vwap:
+            score += 10
+        if rel_vol >= 1.5:
+            score += 10
+        if rel_vol >= 2.5:
+            score += 10
+        last = candles[-1]
+        if float(last["close"]) < float(last["open"]) and day_gain < 0.04:
+            score -= 8
+    if day_gain > 0.09:
+        score -= 15
+
+    features = {
+        "runner_score": int(score),
+        "counts_1m": counts_1m,
+        "counts_3m": counts_3m,
+        "counts_5m": counts_5m,
+        "final_buy_count": buy_count,
+        "day_gain_pct": round(day_gain * 100, 2),
+        "rel_vol_10m": round(rel_vol, 2),
+        "above_vwap": above_vwap,
+        "ltp": round(ltp, 2) if ltp else None,
+    }
+    return int(score), features
+
+
+def _runner_mode_for_score(score: int) -> str:
+    if STRATEGY_MODE == "SUPREME_RUNNER_V2" and score >= RUNNER_MODE_SCORE:
+        return "RUNNER"
+    return "BASE"
 
 
 def _is_market_warmup(now: datetime | None = None) -> bool:
@@ -796,7 +892,7 @@ def _build_depth_context(symbol: str, signal_price: float) -> dict:
     }
 
 
-def _queue_signal(symbol: str) -> bool:
+def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
     candles = _get_1min_candles(symbol, n=5)
     if not candles:
         log.info("QUEUE SKIPPED %s | reason=NO_1M_DATA", symbol)
@@ -830,6 +926,9 @@ def _queue_signal(symbol: str) -> bool:
             "last_candle_check": signal_time,
             "signal_payload": {"high": float(signal_candle["high"]), "close": float(signal_candle["close"])},
             "depth_signal_ctx": depth_ctx,
+            "runner_ctx": runner_ctx or {},
+            "mode": (runner_ctx or {}).get("mode", "BASE"),
+            "runner_score": int((runner_ctx or {}).get("runner_score", 0) or 0),
         }
         _mark_state_dirty()
 
@@ -841,6 +940,7 @@ def _queue_signal(symbol: str) -> bool:
             "signal_high": float(signal_candle["high"]),
             "signal_close": float(signal_candle["close"]),
             "expires_at": (queued_at + timedelta(minutes=SMART_ENTRY_MINS)).isoformat(),
+            "runner_ctx": _serialize_value(runner_ctx or {}),
         },
     )
     return True
@@ -929,6 +1029,7 @@ def _open_shadow_position(symbol: str, price: float, qty: int, trigger: str, bas
 
 def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
     with state_lock:
+        pending_meta = dict(pending.get(symbol) or {})
         if symbol in positions:
             pending.pop(symbol, None)
             _mark_state_dirty()
@@ -961,6 +1062,9 @@ def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
             "tsl_on": False,
             "qty": qty,
             "trigger": trigger,
+            "mode": pending_meta.get("mode", "BASE"),
+            "runner_score": int(pending_meta.get("runner_score", 0) or 0),
+            "runner_ctx": pending_meta.get("runner_ctx", {}),
             "order": order_resp,
         }
         _mark_state_dirty()
@@ -975,6 +1079,9 @@ def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
             "qty": qty,
             "trigger": trigger,
             "mode": TRADING_MODE,
+            "strategy_mode": STRATEGY_MODE,
+            "position_mode": pending_meta.get("mode", "BASE"),
+            "runner_score": int(pending_meta.get("runner_score", 0) or 0),
         },
     )
     _open_shadow_position(symbol, price, qty, trigger, trade_id)
@@ -1075,12 +1182,17 @@ def _evaluate_positions():
         if ltp is None:
             continue
 
+        position_mode = pos.get("mode", "BASE")
+        is_runner = position_mode == "RUNNER"
+        tsl_trigger = RUNNER_TSL_TRIGGER_PCT if is_runner else TSL_TRIGGER_PCT
+        tsl_trail = RUNNER_TSL_TRAIL_PCT if is_runner else TSL_TRAIL_PCT
+
         if ltp > pos["peak"]:
             pos["peak"] = ltp
-        if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + TSL_TRIGGER_PCT):
+        if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + tsl_trigger):
             pos["tsl_on"] = True
         if pos["tsl_on"]:
-            trailing_floor = pos["peak"] * (1 - TSL_TRAIL_PCT)
+            trailing_floor = pos["peak"] * (1 - tsl_trail)
             if trailing_floor > pos["sl"]:
                 pos["sl"] = round(trailing_floor, 2)
 
@@ -1101,7 +1213,9 @@ def _evaluate_positions():
             reason = "SL_HIT"
         elif ltp <= pos["sl"] and pos["tsl_on"]:
             reason = "TSL_HIT"
-        elif (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
+        elif is_runner and (now - pos["entry_time"]).total_seconds() >= RUNNER_STALL_MINS * 60 and pos["peak"] < pos["entry"] * (1 + RUNNER_STALL_PEAK_PCT):
+            reason = "RUNNER_STALL_EXIT"
+        elif not is_runner and (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
             reason = "TIME_EXIT"
 
         if reason:
@@ -1280,12 +1394,22 @@ def dashboard():
             "1m": sum(len(stamps) for stamps in pool_1m.values()),
             "3m": sum(len(stamps) for stamps in pool_3m.values()),
             "5m": sum(len(stamps) for stamps in pool_5m.values()),
+            "final_buy": sum(len(stamps) for stamps in pool_buy.values()),
         }
 
     return jsonify(
         {
             "status": "ONLINE",
             "mode": TRADING_MODE,
+            "strategy_mode": STRATEGY_MODE,
+            "runner_config": {
+                "override_score": RUNNER_OVERRIDE_SCORE,
+                "runner_mode_score": RUNNER_MODE_SCORE,
+                "stall_mins": RUNNER_STALL_MINS,
+                "stall_peak_pct": RUNNER_STALL_PEAK_PCT,
+                "tsl_trigger_pct": RUNNER_TSL_TRIGGER_PCT,
+                "tsl_trail_pct": RUNNER_TSL_TRAIL_PCT,
+            },
             "depth_shadow_enabled": DEPTH_SHADOW_ENABLED,
             "now_ist": _now().isoformat(),
             "master": master_view,
@@ -1403,12 +1527,24 @@ def wh_buy():
     with state_lock:
         open_symbols = set(positions.keys())
         pending_symbols = set(pending.keys())
+        for symbol in symbols:
+            pool_buy.setdefault(symbol.upper(), []).append(now)
+        _mark_state_dirty()
 
     for symbol in symbols:
+        symbol = symbol.upper()
+        runner_score, runner_features = _compute_runner_score(symbol, now)
+        in_master = symbol in latest_master
+        runner_allowed = STRATEGY_MODE == "SUPREME_RUNNER_V2" and runner_score >= RUNNER_OVERRIDE_SCORE
+        runner_ctx = runner_features | {
+            "in_master": in_master,
+            "strategy_mode": STRATEGY_MODE,
+            "mode": _runner_mode_for_score(runner_score),
+        }
         reason = None
         if symbol in BLACKLIST:
             reason = "BLACKLISTED"
-        elif symbol not in latest_master:
+        elif not in_master and not runner_allowed:
             reason = "NOT_IN_MASTER"
         elif symbol in open_symbols:
             reason = "ALREADY_OPEN"
@@ -1419,11 +1555,13 @@ def wh_buy():
 
         if reason:
             skipped.append({"symbol": symbol, "reason": reason})
-            _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": reason})
+            _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": reason, "runner_ctx": runner_ctx})
             continue
 
-        if _queue_signal(symbol):
+        if _queue_signal(symbol, runner_ctx=runner_ctx):
             queued.append(symbol)
+            if not in_master and runner_allowed:
+                _append_event("baseline", "runner_override_queued", {"symbol": symbol, "runner_ctx": runner_ctx})
         else:
             skipped.append({"symbol": symbol, "reason": "QUEUE_FAILED"})
 
