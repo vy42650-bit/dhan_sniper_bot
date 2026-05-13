@@ -273,7 +273,6 @@ def runner_score(symbol: str, day: str, ts: datetime, counts: dict[str, dict[str
     candle = store.get_candle(symbol, day, ts)
     recent_10 = store.get_recent(symbol, day, ts, 10)
     open_price = store.open_price(symbol, day)
-    vwap = store.vwap(symbol, day, ts)
     if not candle or not open_price:
         return 0, {"reason": "NO_CANDLE"}
 
@@ -283,7 +282,6 @@ def runner_score(symbol: str, day: str, ts: datetime, counts: dict[str, dict[str
     cum_vol = store.cumulative_volume(symbol, day, ts)
     expected_10 = (cum_vol / elapsed) * min(10, elapsed) if elapsed > 0 else 0
     rel_vol = (last_10_vol / expected_10) if expected_10 > 0 else 0.0
-    above_vwap = vwap is not None and candle["close"] >= vwap
 
     score = 0
     score += min(30, counts["5m"].get(symbol, 0) * 12)
@@ -293,8 +291,6 @@ def runner_score(symbol: str, day: str, ts: datetime, counts: dict[str, dict[str
     if day_gain >= 0.02:
         score += 15
     if day_gain >= 0.04:
-        score += 10
-    if above_vwap:
         score += 10
     if rel_vol >= 1.5:
         score += 10
@@ -308,7 +304,7 @@ def runner_score(symbol: str, day: str, ts: datetime, counts: dict[str, dict[str
     return int(score), {
         "day_gain_pct": round(day_gain * 100, 2),
         "rel_vol_10m": round(rel_vol, 2),
-        "above_vwap": above_vwap,
+        "above_vwap": None,
         "counts_1m": counts["1m"].get(symbol, 0),
         "counts_3m": counts["3m"].get(symbol, 0),
         "counts_5m": counts["5m"].get(symbol, 0),
@@ -458,7 +454,10 @@ def simulate_day(day: str, maps: dict[str, dict[datetime, list[str]]], has_1m: b
                 )
                 positions.pop(symbol, None)
 
-        for symbol, meta in list(pending.items()):
+        pending_items = sorted(pending.items(), key=lambda item: item[1].runner_score, reverse=True)
+        for symbol, meta in pending_items:
+            if symbol not in pending:
+                continue
             if current >= meta.expires_at:
                 pending.pop(symbol, None)
                 continue

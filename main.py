@@ -85,8 +85,8 @@ WARMUP_END = dt_time(9, 40)
 EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
 SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
-RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "80"))
-RUNNER_MODE_SCORE = int(os.getenv("RUNNER_MODE_SCORE", "95"))
+RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "75"))
+RUNNER_MODE_SCORE = int(os.getenv("RUNNER_MODE_SCORE", "10000"))
 RUNNER_STALL_MINS = int(os.getenv("RUNNER_STALL_MINS", "90"))
 RUNNER_STALL_PEAK_PCT = float(os.getenv("RUNNER_STALL_PEAK_PCT", "0.04"))
 RUNNER_TSL_TRIGGER_PCT = float(os.getenv("RUNNER_TSL_TRIGGER_PCT", "0.025"))
@@ -771,7 +771,7 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
 
     candles = []
     rel_vol = 0.0
-    above_vwap = False
+    above_vwap = None
     # Historical candles are rate-limited, so hydrate only plausible runner candidates.
     if score >= 55:
         candles = _get_1min_candles(symbol, n=40) or []
@@ -794,10 +794,6 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
             typical = (float(candle["high"]) + float(candle["low"]) + float(candle["close"])) / 3
             pv_total += typical * volume
             vol_total += volume
-        vwap = (pv_total / vol_total) if vol_total > 0 else None
-        above_vwap = bool(vwap and ltp >= vwap)
-        if above_vwap:
-            score += 10
         if rel_vol >= 1.5:
             score += 10
         if rel_vol >= 2.5:
@@ -1333,7 +1329,11 @@ def watchdog():
             _prune_all_pools()
             _cancel_pending_eod()
             with state_lock:
-                pending_symbols = list(pending.keys())
+                pending_symbols = sorted(
+                    pending.keys(),
+                    key=lambda symbol: int((pending.get(symbol) or {}).get("runner_score", 0) or 0),
+                    reverse=True,
+                )
             for symbol in pending_symbols:
                 _evaluate_pending(symbol)
             _evaluate_positions()
