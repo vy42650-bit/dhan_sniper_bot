@@ -214,6 +214,48 @@ def _load_recent_shadow_events():
         log.warning("Failed to restore recent shadow events: %s", exc)
 
 
+def _query_event_rows(stream: str | None = None, event_type: str | None = None, day: str | None = None, limit: int = 200):
+    if not os.path.exists(EVENT_DB_FILE):
+        return []
+
+    clauses = []
+    params = []
+    if stream:
+        clauses.append("stream = ?")
+        params.append(stream)
+    if event_type:
+        clauses.append("event_type = ?")
+        params.append(event_type)
+    if day:
+        clauses.append("ts LIKE ?")
+        params.append(f"{day}%")
+
+    sql = "SELECT payload_json FROM events"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 5000)))
+
+    try:
+        with sqlite3.connect(EVENT_DB_FILE) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [json.loads(payload_json) for (payload_json,) in reversed(rows)]
+    except Exception as exc:
+        log.warning("Failed to query events: %s", exc)
+        return []
+
+
+def _filter_trades_by_day(trades: list[dict], day: str | None) -> list[dict]:
+    if not day:
+        return list(trades)
+    prefix = f"{day}T"
+    return [
+        trade
+        for trade in trades
+        if str(trade.get("entry_time", "")).startswith(prefix) or str(trade.get("exit_time", "")).startswith(prefix)
+    ]
+
+
 def _parse_candle_time(raw) -> datetime | None:
     if raw in (None, "", 0):
         return None
@@ -1284,6 +1326,48 @@ def shadow_dashboard():
             "depth_feed": depth_manager.status(),
         }
     return jsonify(payload)
+
+
+@app.get("/admin/trades")
+def admin_trades():
+    day = request.args.get("day")
+    with state_lock:
+        baseline_all = _filter_trades_by_day(_serialize_value(trades_today), day)
+        shadow_all = _filter_trades_by_day(_serialize_value(shadow_trades), day)
+
+    return jsonify(
+        {
+            "day": day,
+            "baseline": {
+                "trade_count": len(baseline_all),
+                "total_pnl": round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in baseline_all), 2),
+                "trades": baseline_all,
+            },
+            "shadow": {
+                "trade_count": len(shadow_all),
+                "total_pnl": round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in shadow_all), 2),
+                "trades": shadow_all,
+            },
+        }
+    )
+
+
+@app.get("/admin/events")
+def admin_events():
+    stream = request.args.get("stream")
+    event_type = request.args.get("event")
+    day = request.args.get("day")
+    limit = request.args.get("limit", default=200, type=int)
+    rows = _query_event_rows(stream=stream, event_type=event_type, day=day, limit=limit)
+    return jsonify(
+        {
+            "stream": stream,
+            "event": event_type,
+            "day": day,
+            "count": len(rows),
+            "events": rows,
+        }
+    )
 
 
 @app.post("/webhook/1min")
