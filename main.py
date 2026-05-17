@@ -76,6 +76,7 @@ ORDER_FALLBACK_TO_PAPER = os.getenv("ORDER_FALLBACK_TO_PAPER", "true").lower() =
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
 STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SUPREME_RUNNER_V2").upper()
 FINAL_1M_STRATEGY_ENABLED = os.getenv("FINAL_1M_STRATEGY_ENABLED", "true").lower() == "true"
+ADMIN_RESET_TOKEN = os.getenv("ADMIN_RESET_TOKEN", "")
 
 
 def _resolve_log_dir() -> tuple[str, str | None]:
@@ -1831,6 +1832,8 @@ def admin_events():
 
 @app.post("/admin/reset")
 def admin_reset():
+    if not ADMIN_RESET_TOKEN or request.args.get("token") != ADMIN_RESET_TOKEN:
+        return jsonify({"status": "forbidden", "message": "admin reset is disabled or token is invalid"}), 403
     reason = request.args.get("reason") or "manual_reset"
     return jsonify({"status": "ok", **_reset_runtime_state(reason=reason)})
 
