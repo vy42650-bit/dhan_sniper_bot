@@ -4,6 +4,7 @@ import itertools
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -474,6 +475,47 @@ def _load_runtime_state():
         len(positions),
         len(shadow_positions),
     )
+
+
+def _archive_file(path: str, label: str) -> str | None:
+    if not os.path.exists(path):
+        return None
+
+    archive_dir = os.path.join(LOG_DIR, "archives")
+    os.makedirs(archive_dir, exist_ok=True)
+    stamp = _now().strftime("%Y%m%d_%H%M%S")
+    archive_path = os.path.join(archive_dir, f"{stamp}_{label}_{os.path.basename(path)}")
+    shutil.move(path, archive_path)
+    return archive_path
+
+
+def _reset_runtime_state(reason: str = "manual_reset") -> dict:
+    archived_state = _archive_file(STATE_FILE, "pre_reset")
+    archived_master = _archive_file(MASTER_FILE, "pre_reset")
+    with state_lock:
+        master.clear()
+        pool_1m.clear()
+        pool_3m.clear()
+        pool_5m.clear()
+        pool_buy.clear()
+        volumes.clear()
+        positions.clear()
+        shadow_positions.clear()
+        pending.clear()
+        trades_today.clear()
+        shadow_trades.clear()
+        shadow_recent_events.clear()
+        _mark_state_dirty()
+    _save_runtime_state(force=True)
+    payload = {
+        "reason": reason,
+        "archived_state": archived_state,
+        "archived_master": archived_master,
+        "reset_at": _now().isoformat(),
+    }
+    _append_event("baseline", "runtime_reset", payload)
+    _append_event("shadow", "runtime_reset", payload)
+    return payload
 
 
 def _save_master():
@@ -1785,6 +1827,12 @@ def admin_events():
             "events": rows,
         }
     )
+
+
+@app.post("/admin/reset")
+def admin_reset():
+    reason = request.args.get("reason") or "manual_reset"
+    return jsonify({"status": "ok", **_reset_runtime_state(reason=reason)})
 
 
 @app.post("/webhook/1min")
