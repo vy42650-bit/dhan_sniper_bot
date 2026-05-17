@@ -1,4 +1,5 @@
 import atexit
+import base64
 import itertools
 import json
 import logging
@@ -39,6 +40,33 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
     "SANDBOX_ACCESS_TOKEN",
     "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJwYXJ0bmVySWQiOiIiLCJkaGFuQ2xpZW50SWQiOiIyNjA1MDE5NjA3Iiwid2ViaG9va1VybCI6IiIsImlzcyI6ImRoYW4iLCJleHAiOjE3Nzg1OTg2MjV9.51ENYq_S8LqRQdJ8QEGstmnZPa5zvxhxBofGEVqW3tkXLjnIkchHVmwial5HM7hkO5fA7YIeo1ZzuxMT9pbmsA",
 )
+
+
+def _jwt_meta(token: str, configured_client_id: str, env_name: str) -> dict:
+    meta = {
+        "env_name": env_name,
+        "configured_client_id": configured_client_id,
+        "from_env": bool(os.getenv(env_name)),
+        "present": bool(token),
+    }
+    try:
+        payload = token.split(".")[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded))
+        exp = data.get("exp")
+        meta.update(
+            {
+                "token_client_id": str(data.get("dhanClientId") or ""),
+                "issuer": data.get("iss"),
+                "consumer_type": data.get("tokenConsumerType"),
+                "expires_at_ist": datetime.fromtimestamp(exp, IST).isoformat() if exp else None,
+                "expired": datetime.now(IST).timestamp() >= exp if exp else None,
+            }
+        )
+    except Exception as exc:
+        meta.update({"decode_error": str(exc), "expired": None})
+    return meta
+
 
 TRADING_MODE = os.getenv("TRADING_MODE", "SANDBOX").upper()
 if os.getenv("FORCE_SANDBOX_ORDERS", "true").lower() == "true":
@@ -1672,6 +1700,10 @@ def dashboard():
                 "supertrend_multiplier": SUPERTREND_MULTIPLIER,
             },
             "depth_shadow_enabled": DEPTH_SHADOW_ENABLED,
+            "token_health": {
+                "main_data": _jwt_meta(MAIN_ACCESS_TOKEN, MAIN_CLIENT_ID, "MAIN_ACCESS_TOKEN"),
+                "sandbox_orders": _jwt_meta(SANDBOX_ACCESS_TOKEN, SANDBOX_CLIENT_ID, "SANDBOX_ACCESS_TOKEN"),
+            },
             "now_ist": _now().isoformat(),
             "master": master_view,
             "pending": pending_view,
