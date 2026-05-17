@@ -41,6 +41,8 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
 )
 
 TRADING_MODE = os.getenv("TRADING_MODE", "SANDBOX").upper()
+if os.getenv("FORCE_SANDBOX_ORDERS", "true").lower() == "true":
+    TRADING_MODE = "SANDBOX"
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
 STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SUPREME_RUNNER_V2").upper()
 FINAL_1M_STRATEGY_ENABLED = os.getenv("FINAL_1M_STRATEGY_ENABLED", "true").lower() == "true"
