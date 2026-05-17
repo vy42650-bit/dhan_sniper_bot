@@ -43,6 +43,7 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
 TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
 STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SUPREME_RUNNER_V2").upper()
+FINAL_1M_STRATEGY_ENABLED = os.getenv("FINAL_1M_STRATEGY_ENABLED", "true").lower() == "true"
 
 
 def _resolve_log_dir() -> tuple[str, str | None]:
@@ -77,20 +78,25 @@ TOP_3M = 20
 MASTER_SIZE = 15
 SMART_ENTRY_MINS = 3
 MAX_RED_CANDLE_PCT = 0.008
-SL_PCT = 0.013
-TSL_TRIGGER_PCT = 0.020
-TSL_TRAIL_PCT = 0.020
-TIME_EXIT_MINS = 45
+SL_PCT = float(os.getenv("SL_PCT", "0.010"))
+TSL_TRIGGER_PCT = float(os.getenv("TSL_TRIGGER_PCT", "0.025"))
+TSL_TRAIL_PCT = float(os.getenv("TSL_TRAIL_PCT", "0.020"))
+TIME_EXIT_MINS = int(os.getenv("TIME_EXIT_MINS", "45"))
 WARMUP_END = dt_time(9, 40)
 EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
 SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
-RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "75"))
+RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "85"))
 RUNNER_MODE_SCORE = int(os.getenv("RUNNER_MODE_SCORE", "10000"))
 RUNNER_STALL_MINS = int(os.getenv("RUNNER_STALL_MINS", "90"))
 RUNNER_STALL_PEAK_PCT = float(os.getenv("RUNNER_STALL_PEAK_PCT", "0.04"))
 RUNNER_TSL_TRIGGER_PCT = float(os.getenv("RUNNER_TSL_TRIGGER_PCT", "0.025"))
 RUNNER_TSL_TRAIL_PCT = float(os.getenv("RUNNER_TSL_TRAIL_PCT", "0.025"))
+ENTRY_CLOSE_POSITION_MIN = float(os.getenv("ENTRY_CLOSE_POSITION_MIN", "0.75"))
+ENTRY_VOLUME_CURR10_MIN = float(os.getenv("ENTRY_VOLUME_CURR10_MIN", "1.05"))
+SUPERTREND_EXIT_ENABLED = os.getenv("SUPERTREND_EXIT_ENABLED", "true").lower() == "true"
+SUPERTREND_ATR_PERIOD = int(os.getenv("SUPERTREND_ATR_PERIOD", "7"))
+SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "3.0"))
 
 pool_1m: dict[str, list[datetime]] = {}
 pool_3m: dict[str, list[datetime]] = {}
@@ -637,6 +643,97 @@ def _get_recent_30min_volume(symbol: str) -> int:
     return int(sum(candle.get("volume", 0) for candle in candles[-30:]))
 
 
+def _volume_curr10(candles: list[dict], idx: int) -> float | None:
+    if idx <= 0:
+        return None
+    prev = candles[max(0, idx - 10):idx]
+    if not prev:
+        return None
+    avg = sum(int(candle.get("volume", 0) or 0) for candle in prev) / len(prev)
+    if avg <= 0:
+        return None
+    return int(candles[idx].get("volume", 0) or 0) / avg
+
+
+def _candle_close_position(candle: dict) -> float | None:
+    high = float(candle.get("high", 0) or 0)
+    low = float(candle.get("low", 0) or 0)
+    close = float(candle.get("close", 0) or 0)
+    span = high - low
+    if span <= 0:
+        return None
+    return (close - low) / span
+
+
+def _true_ranges(candles: list[dict]) -> list[float]:
+    ranges = []
+    prev_close = None
+    for candle in candles:
+        high = float(candle.get("high", 0) or 0)
+        low = float(candle.get("low", 0) or 0)
+        close = float(candle.get("close", 0) or 0)
+        if prev_close is None:
+            true_range = high - low
+        else:
+            true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        ranges.append(max(0.0, true_range))
+        prev_close = close
+    return ranges
+
+
+def _is_supertrend_bearish(symbol: str) -> tuple[bool, dict]:
+    candles = _get_1min_candles(symbol, n=max(80, SUPERTREND_ATR_PERIOD + 20)) or []
+    if len(candles) < SUPERTREND_ATR_PERIOD + 2:
+        return False, {"reason": "INSUFFICIENT_CANDLES", "candles": len(candles)}
+
+    ranges = _true_ranges(candles)
+    final_upper = None
+    final_lower = None
+    prev_upper = None
+    prev_lower = None
+    prev_close = None
+    bullish = True
+    line = None
+
+    for idx, candle in enumerate(candles):
+        high = float(candle.get("high", 0) or 0)
+        low = float(candle.get("low", 0) or 0)
+        close = float(candle.get("close", 0) or 0)
+        if idx + 1 < SUPERTREND_ATR_PERIOD:
+            prev_close = close
+            continue
+
+        atr_window = ranges[idx - SUPERTREND_ATR_PERIOD + 1:idx + 1]
+        atr = sum(atr_window) / len(atr_window)
+        hl2 = (high + low) / 2
+        basic_upper = hl2 + SUPERTREND_MULTIPLIER * atr
+        basic_lower = hl2 - SUPERTREND_MULTIPLIER * atr
+
+        if prev_upper is None or prev_lower is None:
+            final_upper = basic_upper
+            final_lower = basic_lower
+            bullish = close >= final_lower
+        else:
+            final_upper = basic_upper if (basic_upper < prev_upper or prev_close > prev_upper) else prev_upper
+            final_lower = basic_lower if (basic_lower > prev_lower or prev_close < prev_lower) else prev_lower
+            if bullish and close < final_lower:
+                bullish = False
+            elif not bullish and close > final_upper:
+                bullish = True
+
+        line = final_lower if bullish else final_upper
+        prev_upper = final_upper
+        prev_lower = final_lower
+        prev_close = close
+
+    return not bullish, {
+        "period": SUPERTREND_ATR_PERIOD,
+        "multiplier": SUPERTREND_MULTIPLIER,
+        "line": round(line, 2) if line is not None else None,
+        "bullish": bullish,
+    }
+
+
 def _get_daily_turnover_cr(symbol: str, quote: dict | None = None) -> float:
     quote = quote or _get_quote_snapshot(symbol)
     if not quote:
@@ -758,6 +855,54 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
     ltp = float(quote.get("last_price", 0) or 0)
     day_open = float((quote.get("ohlc") or {}).get("open", 0) or 0)
     day_gain = ((ltp - day_open) / day_open) if day_open > 0 and ltp > 0 else 0.0
+
+    if FINAL_1M_STRATEGY_ENABLED:
+        candles = _get_1min_candles(symbol, n=45) or []
+        if ltp <= 0 and candles:
+            ltp = float(candles[-1]["close"])
+        if day_open <= 0 and candles:
+            day_open = float(candles[0]["open"])
+        day_gain = ((ltp - day_open) / day_open) if day_open > 0 and ltp > 0 else day_gain
+
+        rel_vol = 0.0
+        if candles:
+            recent_10_vol = sum(int(candle.get("volume", 0) or 0) for candle in candles[-10:])
+            cumulative_vol = sum(int(candle.get("volume", 0) or 0) for candle in candles)
+            elapsed_mins = max(
+                1,
+                int((now - now.replace(hour=9, minute=15, second=0, microsecond=0)).total_seconds() // 60) + 1,
+            )
+            expected_10_vol = (cumulative_vol / elapsed_mins) * min(10, elapsed_mins) if cumulative_vol > 0 else 0
+            rel_vol = (recent_10_vol / expected_10_vol) if expected_10_vol > 0 else 0.0
+
+        score = min(45, buy_count * 18) + min(40, counts_1m * 10)
+        if day_gain >= 0.02:
+            score += 15
+        if day_gain >= 0.04:
+            score += 10
+        if rel_vol >= 1.5:
+            score += 10
+        if rel_vol >= 2.5:
+            score += 10
+        if day_gain > 0.09:
+            score -= 15
+        if candles:
+            last = candles[-1]
+            if float(last["close"]) < float(last["open"]) and day_gain < 0.04:
+                score -= 8
+
+        features = {
+            "runner_score": int(score),
+            "score_model": "FINAL_BUY_1M",
+            "counts_1m": counts_1m,
+            "counts_3m": counts_3m,
+            "counts_5m": counts_5m,
+            "final_buy_count": buy_count,
+            "day_gain_pct": round(day_gain * 100, 2),
+            "rel_vol_10m": round(rel_vol, 2),
+            "ltp": round(ltp, 2) if ltp else None,
+        }
+        return int(score), features
 
     score = 0
     score += min(30, counts_5m * 12)
@@ -982,6 +1127,64 @@ def _extract_healthy_dip(symbol: str, meta: dict) -> dict | None:
     return None
 
 
+def _extract_final_1m_entry(symbol: str, meta: dict) -> dict | None:
+    candles = _get_1min_candles(symbol, n=20)
+    if not candles:
+        return None
+
+    last_seen = meta.get("last_candle_check") or meta.get("signal_candle_time")
+    newest_seen = last_seen
+    for idx, candle in enumerate(candles):
+        candle_time = _parse_candle_time(candle.get("time"))
+        if candle_time is None:
+            continue
+
+        if newest_seen is None or candle_time > newest_seen:
+            newest_seen = candle_time
+
+        if last_seen and candle_time <= last_seen:
+            continue
+        if candle_time > meta["expires_at"]:
+            continue
+
+        open_price = float(candle.get("open", 0) or 0)
+        high_price = float(candle.get("high", 0) or 0)
+        close_price = float(candle.get("close", 0) or 0)
+        if open_price <= 0 or high_price <= meta["signal_high"]:
+            continue
+        if close_price < open_price:
+            continue
+
+        close_position = _candle_close_position(candle)
+        if close_position is None or close_position < ENTRY_CLOSE_POSITION_MIN:
+            continue
+
+        curr10 = _volume_curr10(candles, idx)
+        if curr10 is None or curr10 < ENTRY_VOLUME_CURR10_MIN:
+            continue
+
+        with state_lock:
+            if symbol in pending:
+                pending[symbol]["last_candle_check"] = newest_seen
+                _mark_state_dirty()
+
+        ltp = _get_ltp(symbol)
+        entry_price = float(ltp) if ltp and ltp > 0 else close_price
+        return {
+            "entry_price": entry_price,
+            "trigger": "BREAKOUT_GREEN_CP75_VOL",
+            "candle_time": candle_time,
+            "close_position": close_position,
+            "volume_curr10": curr10,
+        }
+
+    with state_lock:
+        if symbol in pending:
+            pending[symbol]["last_candle_check"] = newest_seen
+            _mark_state_dirty()
+    return None
+
+
 def _open_shadow_position(symbol: str, price: float, qty: int, trigger: str, baseline_trade_id: str):
     depth_ctx = _build_depth_context(symbol, price)
     payload = {
@@ -1121,6 +1324,7 @@ def _exit(symbol: str, pos: dict, reason: str, exit_price: float):
         "entry_time": pos["entry_time"].isoformat(),
         "exit_time": _now().isoformat(),
         "order": order_resp,
+        "supertrend_ctx": pos.get("supertrend_ctx"),
     }
     with state_lock:
         positions.pop(symbol, None)
@@ -1146,6 +1350,23 @@ def _evaluate_pending(symbol: str):
         return
 
     if current_positions >= MAX_SLOTS:
+        return
+
+    if FINAL_1M_STRATEGY_ENABLED:
+        entry = _extract_final_1m_entry(symbol, meta)
+        if entry:
+            _append_event(
+                "baseline",
+                "final_1m_entry_confirmed",
+                {
+                    "symbol": symbol,
+                    "candle_time": entry["candle_time"].isoformat(),
+                    "close_position": round(entry["close_position"], 3),
+                    "volume_curr10": round(entry["volume_curr10"], 3),
+                    "entry_price": round(entry["entry_price"], 2),
+                },
+            )
+            _execute_entry(symbol, entry["entry_price"], entry["trigger"])
         return
 
     ltp = _get_ltp(symbol)
@@ -1209,6 +1430,11 @@ def _evaluate_positions():
             reason = "SL_HIT"
         elif ltp <= pos["sl"] and pos["tsl_on"]:
             reason = "TSL_HIT"
+        elif SUPERTREND_EXIT_ENABLED and pos.get("tsl_on"):
+            bearish, st_ctx = _is_supertrend_bearish(symbol)
+            if bearish:
+                reason = "ST_AFTER_TSL_EXIT"
+                pos["supertrend_ctx"] = st_ctx
         elif is_runner and (now - pos["entry_time"]).total_seconds() >= RUNNER_STALL_MINS * 60 and pos["peak"] < pos["entry"] * (1 + RUNNER_STALL_PEAK_PCT):
             reason = "RUNNER_STALL_EXIT"
         elif not is_runner and (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
@@ -1303,6 +1529,11 @@ def _evaluate_shadow_positions():
             reason = "SL_HIT"
         elif action != "HOLD" and ltp <= pos["sl"] and pos["tsl_on"]:
             reason = "TSL_HIT"
+        elif action != "HOLD" and SUPERTREND_EXIT_ENABLED and pos.get("tsl_on"):
+            bearish, st_ctx = _is_supertrend_bearish(symbol)
+            if bearish:
+                reason = "ST_AFTER_TSL_EXIT"
+                action_reason = f"SUPERTREND_{st_ctx.get('period')}_{st_ctx.get('multiplier')}"
         elif action != "HOLD" and (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
             reason = "TIME_EXIT"
 
@@ -1409,6 +1640,18 @@ def dashboard():
                 "stall_peak_pct": RUNNER_STALL_PEAK_PCT,
                 "tsl_trigger_pct": RUNNER_TSL_TRIGGER_PCT,
                 "tsl_trail_pct": RUNNER_TSL_TRAIL_PCT,
+            },
+            "final_1m_config": {
+                "enabled": FINAL_1M_STRATEGY_ENABLED,
+                "entry_close_position_min": ENTRY_CLOSE_POSITION_MIN,
+                "entry_volume_curr10_min": ENTRY_VOLUME_CURR10_MIN,
+                "sl_pct": SL_PCT,
+                "tsl_trigger_pct": TSL_TRIGGER_PCT,
+                "tsl_trail_pct": TSL_TRAIL_PCT,
+                "time_exit_mins": TIME_EXIT_MINS,
+                "supertrend_exit_enabled": SUPERTREND_EXIT_ENABLED,
+                "supertrend_atr_period": SUPERTREND_ATR_PERIOD,
+                "supertrend_multiplier": SUPERTREND_MULTIPLIER,
             },
             "depth_shadow_enabled": DEPTH_SHADOW_ENABLED,
             "now_ist": _now().isoformat(),
