@@ -43,6 +43,7 @@ SANDBOX_ACCESS_TOKEN = os.getenv(
 TRADING_MODE = os.getenv("TRADING_MODE", "SANDBOX").upper()
 if os.getenv("FORCE_SANDBOX_ORDERS", "true").lower() == "true":
     TRADING_MODE = "SANDBOX"
+ORDER_FALLBACK_TO_PAPER = os.getenv("ORDER_FALLBACK_TO_PAPER", "true").lower() == "true"
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
 STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SUPREME_RUNNER_V2").upper()
 FINAL_1M_STRATEGY_ENABLED = os.getenv("FINAL_1M_STRATEGY_ENABLED", "true").lower() == "true"
@@ -777,6 +778,20 @@ def _place_order(symbol: str, qty: int, side: str, trade_id: str):
         )
     except Exception as exc:
         log.error("Order placement failed for %s: %s", symbol, exc)
+        if ORDER_FALLBACK_TO_PAPER:
+            fallback = {
+                "status": "success",
+                "mode": "PAPER_FALLBACK",
+                "orderId": _make_id("paper_fallback_order"),
+                "symbol": symbol,
+                "side": side,
+                "quantity": qty,
+                "trade_id": trade_id,
+                "placed_at": _now().isoformat(),
+                "sandbox_error": str(exc),
+            }
+            _append_event("baseline", "sandbox_order_fallback", fallback)
+            return fallback
         return {"status": "error", "message": str(exc)}
 
 
@@ -1645,6 +1660,7 @@ def dashboard():
             },
             "final_1m_config": {
                 "enabled": FINAL_1M_STRATEGY_ENABLED,
+                "order_fallback_to_paper": ORDER_FALLBACK_TO_PAPER,
                 "entry_close_position_min": ENTRY_CLOSE_POSITION_MIN,
                 "entry_volume_curr10_min": ENTRY_VOLUME_CURR10_MIN,
                 "sl_pct": SL_PCT,
