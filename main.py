@@ -656,11 +656,6 @@ def _get_quote_snapshot(symbol: str) -> dict | None:
 
 
 def _get_ltp(symbol: str) -> float | None:
-    depth_now, _, _ = depth_manager.get(symbol)
-    if depth_now:
-        depth_ltp = float(depth_now.get("ltp", 0) or 0)
-        if depth_ltp > 0:
-            return depth_ltp
     quote = _get_quote_snapshot(symbol)
     if not quote:
         return None
@@ -1160,20 +1155,6 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
     signal_candle = candles[-1]
     signal_time = _parse_candle_time(signal_candle.get("time")) or _now()
     queued_at = _now()
-    depth_manager.ensure_symbols([symbol])
-
-    depth_ctx = _build_depth_context(symbol, float(signal_candle["close"]))
-    _append_event(
-        "shadow",
-        "signal_observed",
-        {
-            "symbol": symbol,
-            "signal_high": float(signal_candle["high"]),
-            "signal_close": float(signal_candle["close"]),
-            "queued_at": queued_at.isoformat(),
-            "depth": _serialize_value(depth_ctx),
-        },
-    )
 
     with state_lock:
         pending[symbol] = {
@@ -1184,7 +1165,7 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
             "signal_candle_time": signal_time,
             "last_candle_check": signal_time,
             "signal_payload": {"high": float(signal_candle["high"]), "close": float(signal_candle["close"])},
-            "depth_signal_ctx": depth_ctx,
+            "depth_signal_ctx": {"gate_reason": "NOT_EVALUATED_AT_QUEUE"},
             "runner_ctx": runner_ctx or {},
             "mode": (runner_ctx or {}).get("mode", "BASE"),
             "runner_score": int((runner_ctx or {}).get("runner_score", 0) or 0),
@@ -1202,6 +1183,27 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
             "runner_ctx": _serialize_value(runner_ctx or {}),
         },
     )
+    if DEPTH_SHADOW_ENABLED:
+        depth_manager.ensure_symbols([symbol])
+        depth_now, depth_5s_ago, rolling = depth_manager.get(symbol)
+        _append_event(
+            "shadow",
+            "signal_observed",
+            {
+                "symbol": symbol,
+                "signal_high": float(signal_candle["high"]),
+                "signal_close": float(signal_candle["close"]),
+                "queued_at": queued_at.isoformat(),
+                "depth": _serialize_value(
+                    {
+                        "depth_now": depth_now,
+                        "depth_5s_ago": depth_5s_ago,
+                        "rolling_60s_len": len(rolling),
+                        "gate_reason": "QUEUE_DEPTH_SNAPSHOT_ONLY",
+                    }
+                ),
+            },
+        )
     return True
 
 
@@ -1737,7 +1739,6 @@ def _ingest_symbols(pool: dict[str, list[datetime]], label: str):
             pool.setdefault(symbol, []).append(now)
         _mark_state_dirty()
     _prune_all_pools(now)
-    depth_manager.ensure_symbols(symbols)
     _append_event("baseline", "scanner_ingest", {"label": label, "symbols": symbols})
     return symbols
 
@@ -1908,7 +1909,7 @@ def wh_buy():
         _append_event("baseline", "warmup_bypass", {"symbols": symbols})
         return jsonify(status="warmup", skipped=symbols)
 
-    latest_master = _rebuild_master()
+    latest_master = list(master) if FINAL_1M_STRATEGY_ENABLED else _rebuild_master()
     queued = []
     skipped = []
     with state_lock:
