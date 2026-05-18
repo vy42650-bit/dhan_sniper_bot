@@ -564,6 +564,36 @@ except Exception as exc:
     dhan_orders = None
 
 
+def _ensure_dhan_orders():
+    global dhan_orders
+    if dhan_orders is not None:
+        return
+    try:
+        dhan_orders = dhanhq(client_id=SANDBOX_CLIENT_ID, access_token=SANDBOX_ACCESS_TOKEN)
+        if hasattr(dhan_orders, "dhan_http"):
+            dhan_orders.dhan_http.base_url = "https://sandbox.dhan.co/v2"
+        log.info("Dhan sandbox orders client restored.")
+    except Exception as exc:
+        log.warning("Dhan sandbox orders restore failed: %s", exc)
+        dhan_orders = None
+
+
+def _paper_fallback_order(symbol: str, qty: int, side: str, trade_id: str, message: str) -> dict:
+    fallback = {
+        "status": "success",
+        "mode": "PAPER_FALLBACK",
+        "orderId": _make_id("paper_fallback_order"),
+        "symbol": symbol,
+        "side": side,
+        "quantity": qty,
+        "trade_id": trade_id,
+        "placed_at": _now().isoformat(),
+        "sandbox_error": message,
+    }
+    _append_event("baseline", "sandbox_order_fallback", fallback)
+    return fallback
+
+
 _SECURITY_MAP: dict[str, str] = {}
 try:
     map_path = os.path.join(os.path.dirname(__file__), "security_map.csv")
@@ -834,7 +864,10 @@ def _place_order(symbol: str, qty: int, side: str, trade_id: str):
             "placed_at": _now().isoformat(),
         }
 
+    _ensure_dhan_orders()
     if dhan_orders is None:
+        if ORDER_FALLBACK_TO_PAPER:
+            return _paper_fallback_order(symbol, qty, side, trade_id, "sandbox client unavailable")
         return {"status": "error", "message": "sandbox client unavailable"}
 
     try:
@@ -850,19 +883,7 @@ def _place_order(symbol: str, qty: int, side: str, trade_id: str):
     except Exception as exc:
         log.error("Order placement failed for %s: %s", symbol, exc)
         if ORDER_FALLBACK_TO_PAPER:
-            fallback = {
-                "status": "success",
-                "mode": "PAPER_FALLBACK",
-                "orderId": _make_id("paper_fallback_order"),
-                "symbol": symbol,
-                "side": side,
-                "quantity": qty,
-                "trade_id": trade_id,
-                "placed_at": _now().isoformat(),
-                "sandbox_error": str(exc),
-            }
-            _append_event("baseline", "sandbox_order_fallback", fallback)
-            return fallback
+            return _paper_fallback_order(symbol, qty, side, trade_id, str(exc))
         return {"status": "error", "message": str(exc)}
 
 
@@ -1334,6 +1355,18 @@ def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
             pending.pop(symbol, None)
             _mark_state_dirty()
         log.error("ENTRY FAILED %s | response=%s", symbol, order_resp)
+        _append_event(
+            "baseline",
+            "entry_failed",
+            {
+                "symbol": symbol,
+                "trade_id": trade_id,
+                "entry_price": round(price, 2),
+                "qty": qty,
+                "trigger": trigger,
+                "order_response": _serialize_value(order_resp),
+            },
+        )
         return False
 
     entry_time = _now()
