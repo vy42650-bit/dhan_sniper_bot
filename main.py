@@ -30,6 +30,15 @@ log = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
+
+def _env_time(name: str, default: str) -> dt_time:
+    raw = os.getenv(name, default)
+    try:
+        return datetime.strptime(raw, "%H:%M").time()
+    except ValueError:
+        log.warning("Invalid %s=%r; falling back to %s", name, raw, default)
+        return datetime.strptime(default, "%H:%M").time()
+
 MAIN_CLIENT_ID = os.getenv("MAIN_CLIENT_ID") or os.getenv("DHAN_CLIENT_ID") or "1105120853"
 MAIN_ACCESS_TOKEN = os.getenv(
     "MAIN_ACCESS_TOKEN",
@@ -115,7 +124,7 @@ SL_PCT = float(os.getenv("SL_PCT", "0.010"))
 TSL_TRIGGER_PCT = float(os.getenv("TSL_TRIGGER_PCT", "0.025"))
 TSL_TRAIL_PCT = float(os.getenv("TSL_TRAIL_PCT", "0.020"))
 TIME_EXIT_MINS = int(os.getenv("TIME_EXIT_MINS", "45"))
-WARMUP_END = dt_time(9, 40)
+WARMUP_END = _env_time("TRADING_START_TIME", "09:25")
 EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
 SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
@@ -1764,6 +1773,7 @@ def dashboard():
             },
             "final_1m_config": {
                 "enabled": FINAL_1M_STRATEGY_ENABLED,
+                "trading_start_time": WARMUP_END.strftime("%H:%M"),
                 "order_fallback_to_paper": ORDER_FALLBACK_TO_PAPER,
                 "entry_close_position_min": ENTRY_CLOSE_POSITION_MIN,
                 "entry_volume_curr10_min": ENTRY_VOLUME_CURR10_MIN,
