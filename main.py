@@ -119,7 +119,7 @@ WARMUP_END = dt_time(9, 40)
 EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
 SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
-RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "85"))
+RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "40"))
 RUNNER_MODE_SCORE = int(os.getenv("RUNNER_MODE_SCORE", "10000"))
 RUNNER_STALL_MINS = int(os.getenv("RUNNER_STALL_MINS", "90"))
 RUNNER_STALL_PEAK_PCT = float(os.getenv("RUNNER_STALL_PEAK_PCT", "0.04"))
@@ -1913,15 +1913,20 @@ def wh_buy():
         runner_score, runner_features = _compute_runner_score(symbol, now)
         in_master = symbol in latest_master
         runner_allowed = STRATEGY_MODE == "SUPREME_RUNNER_V2" and runner_score >= RUNNER_OVERRIDE_SCORE
+        final_1m_allowed = FINAL_1M_STRATEGY_ENABLED and runner_score >= RUNNER_OVERRIDE_SCORE
         runner_ctx = runner_features | {
             "in_master": in_master,
             "strategy_mode": STRATEGY_MODE,
             "mode": _runner_mode_for_score(runner_score),
+            "score_floor": RUNNER_OVERRIDE_SCORE,
+            "final_1m_strategy_enabled": FINAL_1M_STRATEGY_ENABLED,
         }
         reason = None
         if symbol in BLACKLIST:
             reason = "BLACKLISTED"
-        elif not in_master and not runner_allowed:
+        elif FINAL_1M_STRATEGY_ENABLED and not final_1m_allowed:
+            reason = "SCORE_BELOW_FLOOR"
+        elif not FINAL_1M_STRATEGY_ENABLED and not in_master and not runner_allowed:
             reason = "NOT_IN_MASTER"
         elif symbol in open_symbols:
             reason = "ALREADY_OPEN"
@@ -1937,7 +1942,9 @@ def wh_buy():
 
         if _queue_signal(symbol, runner_ctx=runner_ctx):
             queued.append(symbol)
-            if not in_master and runner_allowed:
+            if FINAL_1M_STRATEGY_ENABLED:
+                _append_event("baseline", "final_1m_score_queued", {"symbol": symbol, "runner_ctx": runner_ctx})
+            elif not in_master and runner_allowed:
                 _append_event("baseline", "runner_override_queued", {"symbol": symbol, "runner_ctx": runner_ctx})
         else:
             skipped.append({"symbol": symbol, "reason": "QUEUE_FAILED"})
