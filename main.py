@@ -83,6 +83,7 @@ if os.getenv("FORCE_SANDBOX_ORDERS", "true").lower() == "true":
     TRADING_MODE = "SANDBOX"
 ORDER_FALLBACK_TO_PAPER = os.getenv("ORDER_FALLBACK_TO_PAPER", "true").lower() == "true"
 DEPTH_SHADOW_ENABLED = os.getenv("DEPTH_SHADOW_ENABLED", "true").lower() == "true"
+TRIGGER_SHADOW_ENABLED = os.getenv("TRIGGER_SHADOW_ENABLED", "true").lower() == "true"
 STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SUPREME_RUNNER_V2").upper()
 FINAL_1M_STRATEGY_ENABLED = os.getenv("FINAL_1M_STRATEGY_ENABLED", "true").lower() == "true"
 ADMIN_RESET_TOKEN = os.getenv("ADMIN_RESET_TOKEN", "")
@@ -139,6 +140,9 @@ ENTRY_VOLUME_CURR10_MIN = float(os.getenv("ENTRY_VOLUME_CURR10_MIN", "1.05"))
 SUPERTREND_EXIT_ENABLED = os.getenv("SUPERTREND_EXIT_ENABLED", "true").lower() == "true"
 SUPERTREND_ATR_PERIOD = int(os.getenv("SUPERTREND_ATR_PERIOD", "7"))
 SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "3.0"))
+TRIGGER_SHADOW_TICK = float(os.getenv("TRIGGER_SHADOW_TICK", "0.05"))
+TRIGGER_SHADOW_LIMIT_BUFFER_PCT = float(os.getenv("TRIGGER_SHADOW_LIMIT_BUFFER_PCT", "0.002"))
+TRIGGER_SHADOW_VALID_MINS = int(os.getenv("TRIGGER_SHADOW_VALID_MINS", str(SMART_ENTRY_MINS)))
 
 pool_1m: dict[str, list[datetime]] = {}
 pool_3m: dict[str, list[datetime]] = {}
@@ -148,9 +152,12 @@ volumes: dict[str, int] = {}
 master: list[str] = []
 positions: dict[str, dict] = {}
 shadow_positions: dict[str, dict] = {}
+trigger_shadow_orders: dict[str, dict] = {}
+trigger_shadow_positions: dict[str, dict] = {}
 pending: dict[str, dict] = {}
 trades_today: list[dict] = []
 shadow_trades: list[dict] = []
+trigger_shadow_trades: list[dict] = []
 state_lock = threading.RLock()
 log_lock = threading.RLock()
 watchdog_started = False
@@ -527,7 +534,7 @@ def _pool_from_json(raw: dict) -> dict[str, list[datetime]]:
 
 def _position_from_json(raw: dict) -> dict:
     data = dict(raw or {})
-    for key in ("entry_time",):
+    for key in ("entry_time", "signal_candle_time"):
         if key in data:
             data[key] = _parse_dt(data.get(key))
     return data
@@ -535,7 +542,7 @@ def _position_from_json(raw: dict) -> dict:
 
 def _pending_from_json(raw: dict) -> dict:
     data = dict(raw or {})
-    for key in ("queued_at", "expires_at", "signal_candle_time", "last_candle_check"):
+    for key in ("queued_at", "expires_at", "signal_candle_time", "last_candle_check", "armed_at", "triggered_at"):
         if key in data:
             data[key] = _parse_dt(data.get(key))
     return data
@@ -562,9 +569,12 @@ def _save_runtime_state(force: bool = False):
             "volumes": dict(volumes),
             "positions": _serialize_value(positions),
             "shadow_positions": _serialize_value(shadow_positions),
+            "trigger_shadow_orders": _serialize_value(trigger_shadow_orders),
+            "trigger_shadow_positions": _serialize_value(trigger_shadow_positions),
             "pending": _serialize_value(pending),
             "trades_today": _serialize_value(trades_today[-500:]),
             "shadow_trades": _serialize_value(shadow_trades[-500:]),
+            "trigger_shadow_trades": _serialize_value(trigger_shadow_trades[-500:]),
         }
 
     try:
@@ -616,6 +626,20 @@ def _load_runtime_state():
                 for symbol, pos in (payload.get("shadow_positions") or {}).items()
             }
         )
+        trigger_shadow_orders.clear()
+        trigger_shadow_orders.update(
+            {
+                str(symbol).upper(): _pending_from_json(order)
+                for symbol, order in (payload.get("trigger_shadow_orders") or {}).items()
+            }
+        )
+        trigger_shadow_positions.clear()
+        trigger_shadow_positions.update(
+            {
+                str(symbol).upper(): _position_from_json(pos)
+                for symbol, pos in (payload.get("trigger_shadow_positions") or {}).items()
+            }
+        )
         pending.clear()
         pending.update(
             {
@@ -627,13 +651,17 @@ def _load_runtime_state():
         trades_today.extend(payload.get("trades_today") or [])
         shadow_trades.clear()
         shadow_trades.extend(payload.get("shadow_trades") or [])
+        trigger_shadow_trades.clear()
+        trigger_shadow_trades.extend(payload.get("trigger_shadow_trades") or [])
 
     log.info(
-        "Restored runtime state: master=%s pending=%s baseline_open=%s shadow_open=%s",
+        "Restored runtime state: master=%s pending=%s baseline_open=%s shadow_open=%s trigger_orders=%s trigger_open=%s",
         len(master),
         len(pending),
         len(positions),
         len(shadow_positions),
+        len(trigger_shadow_orders),
+        len(trigger_shadow_positions),
     )
 
 
@@ -661,9 +689,12 @@ def _reset_runtime_state(reason: str = "manual_reset") -> dict:
         volumes.clear()
         positions.clear()
         shadow_positions.clear()
+        trigger_shadow_orders.clear()
+        trigger_shadow_positions.clear()
         pending.clear()
         trades_today.clear()
         shadow_trades.clear()
+        trigger_shadow_trades.clear()
         shadow_recent_events.clear()
         _mark_state_dirty()
     _save_runtime_state(force=True)
@@ -1367,6 +1398,7 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None, payload_time: dat
             "runner_ctx": _serialize_value(runner_ctx or {}),
         },
     )
+    _arm_trigger_shadow_order(symbol, signal_candle, signal_time, runner_ctx=runner_ctx)
     if DEPTH_SHADOW_ENABLED:
         depth_manager.ensure_symbols([symbol])
         depth_now, depth_5s_ago, rolling = depth_manager.get(symbol)
@@ -1531,6 +1563,147 @@ def _open_shadow_position(symbol: str, price: float, qty: int, trigger: str, bas
         _mark_state_dirty()
 
     _append_event("shadow", "entry_opened", payload | {"shadow_trade_id": shadow_trade_id})
+
+
+def _round_to_tick(price: float, tick: float = TRIGGER_SHADOW_TICK) -> float:
+    if tick <= 0:
+        return round(price, 2)
+    return round(round(price / tick) * tick, 2)
+
+
+def _arm_trigger_shadow_order(symbol: str, signal_candle: dict, signal_time: datetime, runner_ctx: dict | None = None):
+    if not TRIGGER_SHADOW_ENABLED:
+        return
+
+    now = _now()
+    signal_high = float(signal_candle["high"])
+    trigger_price = _round_to_tick(signal_high + TRIGGER_SHADOW_TICK)
+    limit_price = _round_to_tick(trigger_price * (1 + TRIGGER_SHADOW_LIMIT_BUFFER_PCT))
+    order_id = _make_id("trigger_shadow_order")
+    runner_ctx = runner_ctx or {}
+
+    with state_lock:
+        active_count = len(trigger_shadow_positions) + len(trigger_shadow_orders)
+        if symbol in trigger_shadow_positions:
+            reason = "ALREADY_OPEN"
+        elif symbol in trigger_shadow_orders:
+            reason = "ALREADY_ARMED"
+        elif active_count >= MAX_SLOTS:
+            reason = "SLOTS_FULL"
+        else:
+            reason = None
+
+        if reason:
+            payload = {
+                "symbol": symbol,
+                "reason": reason,
+                "active_count": active_count,
+                "runner_ctx": _serialize_value(runner_ctx),
+                "signal_candle_time": signal_time.isoformat(),
+            }
+        else:
+            trigger_shadow_orders[symbol] = {
+                "order_id": order_id,
+                "symbol": symbol,
+                "armed_at": now,
+                "expires_at": now + timedelta(minutes=TRIGGER_SHADOW_VALID_MINS),
+                "signal_candle_time": signal_time,
+                "signal_high": signal_high,
+                "signal_close": float(signal_candle["close"]),
+                "trigger_price": trigger_price,
+                "limit_price": limit_price,
+                "triggered_at": None,
+                "runner_ctx": runner_ctx,
+                "runner_score": int(runner_ctx.get("runner_score", 0) or 0),
+                "mode": runner_ctx.get("mode", "BASE"),
+            }
+            _mark_state_dirty()
+            payload = dict(trigger_shadow_orders[symbol])
+
+    if reason:
+        _append_event("trigger_shadow", "order_not_armed", payload)
+        return
+
+    _append_event(
+        "trigger_shadow",
+        "order_armed",
+        {
+            "symbol": symbol,
+            "order_id": order_id,
+            "signal_candle_time": signal_time.isoformat(),
+            "signal_high": round(signal_high, 2),
+            "trigger_price": trigger_price,
+            "limit_price": limit_price,
+            "valid_mins": TRIGGER_SHADOW_VALID_MINS,
+            "runner_ctx": _serialize_value(runner_ctx),
+        },
+    )
+
+
+def _open_trigger_shadow_position(symbol: str, order: dict, fill_price: float, fill_reason: str):
+    trade_id = _make_id("trigger_shadow_trade")
+    qty = max(1, int(SLOT_CAPITAL / fill_price))
+    entry_time = _now()
+    with state_lock:
+        trigger_shadow_orders.pop(symbol, None)
+        trigger_shadow_positions[symbol] = {
+            "trade_id": trade_id,
+            "order_id": order["order_id"],
+            "entry": fill_price,
+            "entry_time": entry_time,
+            "peak": fill_price,
+            "hard_sl": round(fill_price * (1 - SL_PCT), 2),
+            "sl": round(fill_price * (1 - SL_PCT), 2),
+            "tsl_on": False,
+            "qty": qty,
+            "trigger": "BROKER_SIDE_STOP_LIMIT_SHADOW",
+            "mode": order.get("mode", "BASE"),
+            "runner_score": int(order.get("runner_score", 0) or 0),
+            "runner_ctx": order.get("runner_ctx", {}),
+            "trigger_price": order["trigger_price"],
+            "limit_price": order["limit_price"],
+            "signal_candle_time": order["signal_candle_time"],
+        }
+        _mark_state_dirty()
+
+    _append_event(
+        "trigger_shadow",
+        "entry_opened",
+        {
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "order_id": order["order_id"],
+            "entry_price": round(fill_price, 2),
+            "qty": qty,
+            "fill_reason": fill_reason,
+            "trigger_price": order["trigger_price"],
+            "limit_price": order["limit_price"],
+            "runner_score": int(order.get("runner_score", 0) or 0),
+        },
+    )
+
+
+def _close_trigger_shadow_position(symbol: str, pos: dict, reason: str, exit_price: float):
+    pnl_rs = ((exit_price - pos["entry"]) / pos["entry"]) * SLOT_CAPITAL
+    trade = {
+        "trade_id": pos["trade_id"],
+        "order_id": pos.get("order_id"),
+        "symbol": symbol,
+        "entry_p": round(pos["entry"], 2),
+        "exit_p": round(exit_price, 2),
+        "reason": reason,
+        "trigger": pos.get("trigger"),
+        "pnl_rs": round(pnl_rs, 2),
+        "entry_time": pos["entry_time"].isoformat(),
+        "exit_time": _now().isoformat(),
+        "runner_score": int(pos.get("runner_score", 0) or 0),
+        "supertrend_ctx": pos.get("supertrend_ctx"),
+    }
+    with state_lock:
+        trigger_shadow_positions.pop(symbol, None)
+        trigger_shadow_trades.append(trade)
+        _mark_state_dirty()
+    _append_event("trigger_shadow", "exit_closed", trade)
 
 
 def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
@@ -1860,17 +2033,143 @@ def _evaluate_shadow_positions():
             _close_shadow_position(symbol, pos, reason, ltp, action_reason)
 
 
+def _evaluate_trigger_shadow_orders():
+    if not TRIGGER_SHADOW_ENABLED:
+        return
+
+    with state_lock:
+        snapshot = [(symbol, dict(order)) for symbol, order in trigger_shadow_orders.items()]
+        open_count = len(trigger_shadow_positions)
+
+    now = _now()
+    for symbol, order in snapshot:
+        if now >= order["expires_at"]:
+            with state_lock:
+                trigger_shadow_orders.pop(symbol, None)
+                _mark_state_dirty()
+            _append_event(
+                "trigger_shadow",
+                "order_cancelled",
+                {
+                    "symbol": symbol,
+                    "order_id": order["order_id"],
+                    "reason": "TTL_EXPIRED",
+                    "triggered_at": order.get("triggered_at").isoformat() if order.get("triggered_at") else None,
+                    "trigger_price": order["trigger_price"],
+                    "limit_price": order["limit_price"],
+                },
+            )
+            continue
+
+        ltp = _get_ltp(symbol)
+        if ltp is None:
+            continue
+
+        if open_count >= MAX_SLOTS:
+            continue
+
+        triggered_at = order.get("triggered_at")
+        if triggered_at is None and ltp >= order["trigger_price"]:
+            triggered_at = now
+            with state_lock:
+                live_order = trigger_shadow_orders.get(symbol)
+                if live_order is None:
+                    continue
+                live_order["triggered_at"] = triggered_at
+                _mark_state_dirty()
+                order = dict(live_order)
+            _append_event(
+                "trigger_shadow",
+                "order_triggered",
+                {
+                    "symbol": symbol,
+                    "order_id": order["order_id"],
+                    "ltp": round(ltp, 2),
+                    "trigger_price": order["trigger_price"],
+                    "limit_price": order["limit_price"],
+                    "triggered_at": triggered_at.isoformat(),
+                },
+            )
+
+        if triggered_at is not None and ltp <= order["limit_price"]:
+            fill_price = max(float(ltp), float(order["trigger_price"]))
+            _open_trigger_shadow_position(symbol, order, fill_price, "TRIGGER_HIT_LIMIT_FILL")
+            open_count += 1
+
+
+def _evaluate_trigger_shadow_positions():
+    if not TRIGGER_SHADOW_ENABLED:
+        return
+
+    with state_lock:
+        snapshot = [(symbol, dict(pos)) for symbol, pos in trigger_shadow_positions.items()]
+
+    now = _now()
+    eod = _is_eod(now)
+    for symbol, pos in snapshot:
+        ltp = _get_ltp(symbol)
+        if ltp is None:
+            continue
+
+        position_mode = pos.get("mode", "BASE")
+        is_runner = position_mode == "RUNNER"
+        tsl_trigger = RUNNER_TSL_TRIGGER_PCT if is_runner else TSL_TRIGGER_PCT
+        tsl_trail = RUNNER_TSL_TRAIL_PCT if is_runner else TSL_TRAIL_PCT
+
+        if ltp > pos["peak"]:
+            pos["peak"] = ltp
+        if not pos["tsl_on"] and ltp >= pos["entry"] * (1 + tsl_trigger):
+            pos["tsl_on"] = True
+        if pos["tsl_on"]:
+            trailing_floor = pos["peak"] * (1 - tsl_trail)
+            if trailing_floor > pos["sl"]:
+                pos["sl"] = round(trailing_floor, 2)
+
+        with state_lock:
+            live_pos = trigger_shadow_positions.get(symbol)
+            if live_pos is None:
+                continue
+            live_pos["peak"] = pos["peak"]
+            live_pos["tsl_on"] = pos["tsl_on"]
+            live_pos["sl"] = pos["sl"]
+            _mark_state_dirty()
+            pos = dict(live_pos)
+
+        reason = None
+        if eod:
+            reason = "EOD_EXIT"
+        elif ltp <= pos["hard_sl"]:
+            reason = "SL_HIT"
+        elif ltp <= pos["sl"] and pos["tsl_on"]:
+            reason = "TSL_HIT"
+        elif SUPERTREND_EXIT_ENABLED and pos.get("tsl_on"):
+            bearish, st_ctx = _is_supertrend_bearish(symbol)
+            if bearish:
+                reason = "ST_AFTER_TSL_EXIT"
+                pos["supertrend_ctx"] = st_ctx
+        elif is_runner and (now - pos["entry_time"]).total_seconds() >= RUNNER_STALL_MINS * 60 and pos["peak"] < pos["entry"] * (1 + RUNNER_STALL_PEAK_PCT):
+            reason = "RUNNER_STALL_EXIT"
+        elif not is_runner and (now - pos["entry_time"]).total_seconds() >= TIME_EXIT_MINS * 60:
+            reason = "TIME_EXIT"
+
+        if reason:
+            _close_trigger_shadow_position(symbol, pos, reason, ltp)
+
+
 def _cancel_pending_eod():
     if not _is_eod():
         return
 
     with state_lock:
-        if not pending:
+        if not pending and not trigger_shadow_orders:
             return
         cancelled = list(pending.keys())
+        trigger_cancelled = list(trigger_shadow_orders.keys())
         pending.clear()
+        trigger_shadow_orders.clear()
         _mark_state_dirty()
     _append_event("baseline", "pending_cleared_eod", {"symbols": cancelled})
+    _append_event("trigger_shadow", "orders_cleared_eod", {"symbols": trigger_cancelled})
 
 
 def watchdog():
@@ -1888,6 +2187,8 @@ def watchdog():
                 _evaluate_pending(symbol)
             _evaluate_positions()
             _evaluate_shadow_positions()
+            _evaluate_trigger_shadow_orders()
+            _evaluate_trigger_shadow_positions()
             _save_runtime_state()
         except Exception as exc:
             log.error("Watchdog error: %s", exc, exc_info=True)
@@ -1904,7 +2205,16 @@ def _bootstrap_runtime():
     _load_recent_shadow_events()
     _prune_all_pools()
     depth_manager.start()
-    depth_manager.ensure_symbols(list(set(master) | set(positions.keys()) | set(shadow_positions.keys()) | set(pending.keys())))
+    depth_manager.ensure_symbols(
+        list(
+            set(master)
+            | set(positions.keys())
+            | set(shadow_positions.keys())
+            | set(trigger_shadow_positions.keys())
+            | set(trigger_shadow_orders.keys())
+            | set(pending.keys())
+        )
+    )
 
     if watchdog_started:
         return
@@ -1937,6 +2247,9 @@ def dashboard():
         baseline_trades = _serialize_value(trades_today[-30:])
         shadow_open = _serialize_value(shadow_positions)
         shadow_closed = _serialize_value(shadow_trades[-30:])
+        trigger_shadow_orders_view = _serialize_value(trigger_shadow_orders)
+        trigger_shadow_open = _serialize_value(trigger_shadow_positions)
+        trigger_shadow_closed = _serialize_value(trigger_shadow_trades[-30:])
         pending_view = _serialize_value(pending)
         master_view = list(master)
         pools = {
@@ -1972,6 +2285,10 @@ def dashboard():
                 "supertrend_exit_enabled": SUPERTREND_EXIT_ENABLED,
                 "supertrend_atr_period": SUPERTREND_ATR_PERIOD,
                 "supertrend_multiplier": SUPERTREND_MULTIPLIER,
+                "trigger_shadow_enabled": TRIGGER_SHADOW_ENABLED,
+                "trigger_shadow_tick": TRIGGER_SHADOW_TICK,
+                "trigger_shadow_limit_buffer_pct": TRIGGER_SHADOW_LIMIT_BUFFER_PCT,
+                "trigger_shadow_valid_mins": TRIGGER_SHADOW_VALID_MINS,
             },
             "depth_shadow_enabled": DEPTH_SHADOW_ENABLED,
             "token_health": {
@@ -1981,6 +2298,7 @@ def dashboard():
             "now_ist": _now().isoformat(),
             "master": master_view,
             "pending": pending_view,
+            "trigger_shadow_orders": trigger_shadow_orders_view,
             "positions": baseline_positions,
             "shadow_positions": shadow_open,
             "pools": pools,
@@ -1996,6 +2314,15 @@ def dashboard():
                 "total_pnl": round(sum(trade["pnl_rs"] for trade in shadow_trades), 2),
                 "recent_trades": shadow_closed,
                 "recent_events": list(shadow_recent_events)[-50:],
+            },
+            "trigger_shadow": {
+                "enabled": TRIGGER_SHADOW_ENABLED,
+                "armed_count": len(trigger_shadow_orders_view),
+                "open_count": len(trigger_shadow_open),
+                "trade_count": len(trigger_shadow_trades),
+                "total_pnl": round(sum(trade["pnl_rs"] for trade in trigger_shadow_trades), 2),
+                "open_positions": trigger_shadow_open,
+                "recent_trades": trigger_shadow_closed,
             },
             "depth_feed": depth_manager.status(),
             "depth_buffer": depth_manager.buffer.stats(),
@@ -2013,6 +2340,9 @@ def shadow_dashboard():
         payload = {
             "open_positions": _serialize_value(shadow_positions),
             "closed_trades": _serialize_value(shadow_trades[-100:]),
+            "trigger_shadow_orders": _serialize_value(trigger_shadow_orders),
+            "trigger_shadow_positions": _serialize_value(trigger_shadow_positions),
+            "trigger_shadow_trades": _serialize_value(trigger_shadow_trades[-100:]),
             "recent_events": list(shadow_recent_events),
             "depth_feed": depth_manager.status(),
         }
@@ -2025,6 +2355,7 @@ def admin_trades():
     with state_lock:
         baseline_all = _filter_trades_by_day(_serialize_value(trades_today), day)
         shadow_all = _filter_trades_by_day(_serialize_value(shadow_trades), day)
+        trigger_shadow_all = _filter_trades_by_day(_serialize_value(trigger_shadow_trades), day)
 
     return jsonify(
         {
@@ -2038,6 +2369,11 @@ def admin_trades():
                 "trade_count": len(shadow_all),
                 "total_pnl": round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in shadow_all), 2),
                 "trades": shadow_all,
+            },
+            "trigger_shadow": {
+                "trade_count": len(trigger_shadow_all),
+                "total_pnl": round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in trigger_shadow_all), 2),
+                "trades": trigger_shadow_all,
             },
         }
     )
