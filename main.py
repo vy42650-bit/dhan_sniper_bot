@@ -1608,6 +1608,7 @@ def _arm_trigger_shadow_order(symbol: str, signal_candle: dict, signal_time: dat
                 "armed_at": now,
                 "expires_at": now + timedelta(minutes=TRIGGER_SHADOW_VALID_MINS),
                 "signal_candle_time": signal_time,
+                "last_candle_check": signal_time,
                 "signal_high": signal_high,
                 "signal_close": float(signal_candle["close"]),
                 "trigger_price": trigger_price,
@@ -1638,6 +1639,49 @@ def _arm_trigger_shadow_order(symbol: str, signal_candle: dict, signal_time: dat
             "runner_ctx": _serialize_value(runner_ctx),
         },
     )
+
+
+def _trigger_shadow_candle_fill(symbol: str, order: dict) -> tuple[float, dict] | None:
+    """Fallback shadow fill check so fast breakouts are not missed by LTP polling."""
+    candles = _get_1min_candles(symbol, n=8)
+    if not candles:
+        return None
+
+    last_seen = order.get("last_candle_check") or order.get("signal_candle_time")
+    newest_seen = last_seen
+    for candle in candles:
+        candle_time = _parse_candle_time(candle.get("time"))
+        if candle_time is None:
+            continue
+        if newest_seen is None or candle_time > newest_seen:
+            newest_seen = candle_time
+        if last_seen and candle_time <= last_seen:
+            continue
+        if candle_time > order["expires_at"]:
+            continue
+
+        high_price = float(candle.get("high", 0) or 0)
+        low_price = float(candle.get("low", 0) or 0)
+        if high_price >= order["trigger_price"]:
+            # A buy stop-limit resting at the broker should trigger at the stop.
+            # Since the limit is above the stop, a print through the stop is a
+            # practical fill assumption for shadow comparison.
+            fill_price = float(order["trigger_price"])
+            if low_price > order["limit_price"]:
+                fill_price = float(order["limit_price"])
+            return fill_price, {
+                "candle_time": candle_time,
+                "candle_high": high_price,
+                "candle_low": low_price,
+                "last_candle_check": newest_seen,
+            }
+
+    with state_lock:
+        live_order = trigger_shadow_orders.get(symbol)
+        if live_order is not None and newest_seen and newest_seen != live_order.get("last_candle_check"):
+            live_order["last_candle_check"] = newest_seen
+            _mark_state_dirty()
+    return None
 
 
 def _open_trigger_shadow_position(symbol: str, order: dict, fill_price: float, fill_reason: str):
@@ -2061,14 +2105,45 @@ def _evaluate_trigger_shadow_orders():
             )
             continue
 
-        ltp = _get_ltp(symbol)
-        if ltp is None:
-            continue
-
         if open_count >= MAX_SLOTS:
             continue
 
         triggered_at = order.get("triggered_at")
+        candle_fill = None
+        if triggered_at is None:
+            candle_fill = _trigger_shadow_candle_fill(symbol, order)
+            if candle_fill is not None:
+                fill_price, fill_ctx = candle_fill
+                with state_lock:
+                    live_order = trigger_shadow_orders.get(symbol)
+                    if live_order is None:
+                        continue
+                    live_order["triggered_at"] = fill_ctx["candle_time"]
+                    live_order["last_candle_check"] = fill_ctx["last_candle_check"]
+                    _mark_state_dirty()
+                    order = dict(live_order)
+                _append_event(
+                    "trigger_shadow",
+                    "order_triggered",
+                    {
+                        "symbol": symbol,
+                        "order_id": order["order_id"],
+                        "trigger_price": order["trigger_price"],
+                        "limit_price": order["limit_price"],
+                        "triggered_at": fill_ctx["candle_time"].isoformat(),
+                        "fill_detection": "1M_CANDLE_RECONCILIATION",
+                        "candle_high": round(fill_ctx["candle_high"], 2),
+                        "candle_low": round(fill_ctx["candle_low"], 2),
+                    },
+                )
+                _open_trigger_shadow_position(symbol, order, fill_price, "TRIGGER_HIT_CANDLE_RECONCILED")
+                open_count += 1
+                continue
+
+        ltp = _get_ltp(symbol)
+        if ltp is None:
+            continue
+
         if triggered_at is None and ltp >= order["trigger_price"]:
             triggered_at = now
             with state_lock:
