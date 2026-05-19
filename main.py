@@ -875,7 +875,7 @@ def _place_order(symbol: str, qty: int, side: str, trade_id: str):
         return {"status": "error", "message": "sandbox client unavailable"}
 
     try:
-        return dhan_orders.place_order(
+        resp = dhan_orders.place_order(
             security_id=_resolve_security_id(symbol),
             exchange_segment="NSE_EQ",
             transaction_type="BUY" if side == "BUY" else "SELL",
@@ -884,6 +884,10 @@ def _place_order(symbol: str, qty: int, side: str, trade_id: str):
             product_type="INTRA",
             price=0,
         )
+        status = str(resp.get("status", "")).lower() if isinstance(resp, dict) else ""
+        if status in {"error", "failure", "rejected"} and ORDER_FALLBACK_TO_PAPER:
+            return _paper_fallback_order(symbol, qty, side, trade_id, json.dumps(_serialize_value(resp)))
+        return resp
     except Exception as exc:
         log.error("Order placement failed for %s: %s", symbol, exc)
         if ORDER_FALLBACK_TO_PAPER:
