@@ -337,11 +337,42 @@ def _parse_candle_time(raw) -> datetime | None:
     return None
 
 
+def _parse_chartink_time(raw) -> datetime | None:
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, (int, float)):
+        return _parse_candle_time(raw)
+
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    normalized = " ".join(text.replace(",", " ").split())
+    formats = [
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d-%m-%Y %I:%M:%S %p",
+        "%d-%m-%Y %I:%M %p",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt).replace(tzinfo=IST)
+        except ValueError:
+            continue
+    return _parse_candle_time(text)
+
+
 def _floor_minute(value: datetime) -> datetime:
     return value.astimezone(IST).replace(second=0, microsecond=0)
 
 
-def _alert_signal_cutoff(now: datetime | None = None) -> datetime:
+def _alert_signal_cutoff(now: datetime | None = None, payload_time: datetime | None = None) -> datetime:
+    if payload_time is not None:
+        return _floor_minute(payload_time)
     # Chartink 1m alerts arrive after the candle closes. Anchor the signal to
     # the prior completed minute instead of Dhan's possibly in-progress candle.
     return _floor_minute(now or _now()) - timedelta(minutes=1)
@@ -356,12 +387,17 @@ def _candles_until(candles: list[dict], cutoff: datetime) -> list[dict]:
     return selected
 
 
-def _select_alert_signal_candle(candles: list[dict], now: datetime | None = None) -> tuple[dict | None, datetime | None, datetime, str]:
-    cutoff = _alert_signal_cutoff(now)
+def _select_alert_signal_candle(
+    candles: list[dict],
+    now: datetime | None = None,
+    payload_time: datetime | None = None,
+) -> tuple[dict | None, datetime | None, datetime, str]:
+    cutoff = _alert_signal_cutoff(now, payload_time=payload_time)
     selected = _candles_until(candles, cutoff)
     if selected:
         candle = selected[-1]
-        return candle, _parse_candle_time(candle.get("time")), cutoff, "ALERT_PREVIOUS_COMPLETED_1M"
+        source = "PAYLOAD_SIGNAL_TIME" if payload_time is not None else "ALERT_PREVIOUS_COMPLETED_1M"
+        return candle, _parse_candle_time(candle.get("time")), cutoff, source
 
     # If Dhan omits timestamps or returns an unusual payload, avoid using the
     # freshest candle as the signal candle during market hours.
@@ -374,25 +410,90 @@ def _select_alert_signal_candle(candles: list[dict], now: datetime | None = None
     return None, None, cutoff, "NO_CANDLE"
 
 
-def _parse_symbols_from_request() -> list[str]:
+def _payload_items_from_request() -> list[dict]:
     payload = request.get_json(silent=True) or {}
-    raw = payload.get("stocks", payload.get("symbol", []))
+    raw = payload.get("stocks") or payload.get("data") or payload.get("rows") or payload.get("results")
+    if raw is None and any(key in payload for key in ("symbol", "Symbol", "SYMBOL", "nsecode", "NSE Code", "stock", "Stock", "ticker", "Ticker")):
+        return [payload]
     if isinstance(raw, str):
-        items = raw.split(",")
-    elif isinstance(raw, list):
-        items = raw
-    else:
-        items = []
+        shared_fields = {
+            key: payload.get(key)
+            for key in (
+                "date",
+                "Date",
+                "DATE",
+                "datetime",
+                "Datetime",
+                "timestamp",
+                "Timestamp",
+                "time",
+                "Time",
+                "scan_time",
+                "triggered_at",
+                "trigger_time",
+            )
+            if payload.get(key) not in (None, "")
+        }
+        return [{"symbol": item.strip(), **shared_fields} for item in raw.split(",") if item.strip()]
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [{"symbol": item} if not isinstance(item, dict) else item for item in raw]
+    return []
 
-    symbols = []
+
+def _symbol_from_payload_item(item: dict) -> str:
+    for key in ("symbol", "Symbol", "SYMBOL", "nsecode", "NSE Code", "stock", "Stock", "ticker", "Ticker"):
+        value = item.get(key)
+        if value:
+            return str(value).strip().upper()
+    return ""
+
+
+def _timestamp_from_payload_item(item: dict) -> datetime | None:
+    for key in (
+        "date",
+        "Date",
+        "DATE",
+        "datetime",
+        "Datetime",
+        "timestamp",
+        "Timestamp",
+        "time",
+        "Time",
+        "scan_time",
+        "triggered_at",
+        "trigger_time",
+    ):
+        value = item.get(key)
+        parsed = _parse_chartink_time(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_signal_items_from_request() -> list[dict]:
+    items = []
     seen = set()
-    for item in items:
-        symbol = str(item).strip().upper()
+    for item in _payload_items_from_request():
+        symbol = _symbol_from_payload_item(item)
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
-        symbols.append(symbol)
-    return symbols
+        items.append({"symbol": symbol, "payload_time": _timestamp_from_payload_item(item), "raw": item})
+    return items
+
+
+def _parse_symbols_from_request() -> list[str]:
+    return [item["symbol"] for item in _parse_signal_items_from_request()]
+
+
+def _request_signal_time_by_symbol() -> dict[str, datetime]:
+    return {
+        item["symbol"]: item["payload_time"]
+        for item in _parse_signal_items_from_request()
+        if item.get("payload_time") is not None
+    }
 
 
 def _pool_to_json(pool: dict[str, list[datetime]]) -> dict[str, list[str]]:
@@ -995,7 +1096,11 @@ def _rebuild_master() -> list[str]:
     return final_master
 
 
-def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int, dict]:
+def _compute_runner_score(
+    symbol: str,
+    now: datetime | None = None,
+    payload_time: datetime | None = None,
+) -> tuple[int, dict]:
     now = now or _now()
     symbol = symbol.upper()
     with state_lock:
@@ -1012,7 +1117,7 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
 
     if FINAL_1M_STRATEGY_ENABLED:
         candles = _get_1min_candles(symbol, n=45) or []
-        signal_cutoff = _alert_signal_cutoff(now)
+        signal_cutoff = _alert_signal_cutoff(now, payload_time=payload_time)
         score_candles = _candles_until(candles, signal_cutoff) or candles
         score_candle = score_candles[-1] if score_candles else None
         score_price = float(score_candle["close"]) if score_candle else ltp
@@ -1061,6 +1166,8 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
             "ltp": round(ltp, 2) if ltp else None,
             "score_candle_time": score_candle_time.isoformat() if score_candle_time else None,
             "score_signal_cutoff": signal_cutoff.isoformat(),
+            "score_signal_source": "PAYLOAD_SIGNAL_TIME" if payload_time is not None else "ALERT_PREVIOUS_COMPLETED_1M",
+            "payload_time": payload_time.isoformat() if payload_time else None,
         }
         return int(score), features
 
@@ -1193,14 +1300,18 @@ def _build_depth_context(symbol: str, signal_price: float) -> dict:
     }
 
 
-def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
+def _queue_signal(symbol: str, runner_ctx: dict | None = None, payload_time: datetime | None = None) -> bool:
     queued_at = _now()
     candles = _get_1min_candles(symbol, n=10)
     if not candles:
         log.info("QUEUE SKIPPED %s | reason=NO_1M_DATA", symbol)
         return False
 
-    signal_candle, signal_time, signal_cutoff, signal_source = _select_alert_signal_candle(candles, queued_at)
+    signal_candle, signal_time, signal_cutoff, signal_source = _select_alert_signal_candle(
+        candles,
+        queued_at,
+        payload_time=payload_time,
+    )
     if not signal_candle:
         log.info("QUEUE SKIPPED %s | reason=NO_SIGNAL_CANDLE", symbol)
         return False
@@ -1238,6 +1349,7 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
             "signal_candle_time": signal_time.isoformat(),
             "signal_cutoff": signal_cutoff.isoformat(),
             "signal_source": signal_source,
+            "payload_time": payload_time.isoformat() if payload_time else None,
             "queued_at": queued_at.isoformat(),
             "expires_at": (queued_at + timedelta(minutes=SMART_ENTRY_MINS)).isoformat(),
             "runner_ctx": _serialize_value(runner_ctx or {}),
@@ -1255,6 +1367,7 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
                 "signal_close": float(signal_candle["close"]),
                 "signal_candle_time": signal_time.isoformat(),
                 "signal_source": signal_source,
+                "payload_time": payload_time.isoformat() if payload_time else None,
                 "queued_at": queued_at.isoformat(),
                 "depth": _serialize_value(
                     {
@@ -1967,6 +2080,7 @@ def wh5():
 def wh_buy():
     now = _now()
     symbols = _parse_symbols_from_request()
+    payload_times = _request_signal_time_by_symbol()
     if _is_market_warmup(now):
         _append_event("baseline", "warmup_bypass", {"symbols": symbols})
         return jsonify(status="warmup", skipped=symbols)
@@ -1983,7 +2097,8 @@ def wh_buy():
 
     for symbol in symbols:
         symbol = symbol.upper()
-        runner_score, runner_features = _compute_runner_score(symbol, now)
+        payload_time = payload_times.get(symbol)
+        runner_score, runner_features = _compute_runner_score(symbol, now, payload_time=payload_time)
         in_master = symbol in latest_master
         runner_allowed = STRATEGY_MODE == "SUPREME_RUNNER_V2" and runner_score >= RUNNER_OVERRIDE_SCORE
         final_1m_allowed = FINAL_1M_STRATEGY_ENABLED and runner_score >= RUNNER_OVERRIDE_SCORE
@@ -2013,7 +2128,7 @@ def wh_buy():
             _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": reason, "runner_ctx": runner_ctx})
             continue
 
-        if _queue_signal(symbol, runner_ctx=runner_ctx):
+        if _queue_signal(symbol, runner_ctx=runner_ctx, payload_time=payload_time):
             queued.append(symbol)
             if FINAL_1M_STRATEGY_ENABLED:
                 _append_event("baseline", "final_1m_score_queued", {"symbol": symbol, "runner_ctx": runner_ctx})
