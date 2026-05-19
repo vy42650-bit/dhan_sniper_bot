@@ -337,6 +337,43 @@ def _parse_candle_time(raw) -> datetime | None:
     return None
 
 
+def _floor_minute(value: datetime) -> datetime:
+    return value.astimezone(IST).replace(second=0, microsecond=0)
+
+
+def _alert_signal_cutoff(now: datetime | None = None) -> datetime:
+    # Chartink 1m alerts arrive after the candle closes. Anchor the signal to
+    # the prior completed minute instead of Dhan's possibly in-progress candle.
+    return _floor_minute(now or _now()) - timedelta(minutes=1)
+
+
+def _candles_until(candles: list[dict], cutoff: datetime) -> list[dict]:
+    selected = []
+    for candle in candles or []:
+        candle_time = _parse_candle_time(candle.get("time"))
+        if candle_time is not None and candle_time <= cutoff:
+            selected.append(candle)
+    return selected
+
+
+def _select_alert_signal_candle(candles: list[dict], now: datetime | None = None) -> tuple[dict | None, datetime | None, datetime, str]:
+    cutoff = _alert_signal_cutoff(now)
+    selected = _candles_until(candles, cutoff)
+    if selected:
+        candle = selected[-1]
+        return candle, _parse_candle_time(candle.get("time")), cutoff, "ALERT_PREVIOUS_COMPLETED_1M"
+
+    # If Dhan omits timestamps or returns an unusual payload, avoid using the
+    # freshest candle as the signal candle during market hours.
+    if len(candles or []) >= 2:
+        candle = candles[-2]
+        return candle, _parse_candle_time(candle.get("time")), cutoff, "FALLBACK_PREVIOUS_INDEX"
+    if candles:
+        candle = candles[-1]
+        return candle, _parse_candle_time(candle.get("time")), cutoff, "FALLBACK_ONLY_CANDLE"
+    return None, None, cutoff, "NO_CANDLE"
+
+
 def _parse_symbols_from_request() -> list[str]:
     payload = request.get_json(silent=True) or {}
     raw = payload.get("stocks", payload.get("symbol", []))
@@ -975,19 +1012,23 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
 
     if FINAL_1M_STRATEGY_ENABLED:
         candles = _get_1min_candles(symbol, n=45) or []
-        if ltp <= 0 and candles:
-            ltp = float(candles[-1]["close"])
+        signal_cutoff = _alert_signal_cutoff(now)
+        score_candles = _candles_until(candles, signal_cutoff) or candles
+        score_candle = score_candles[-1] if score_candles else None
+        score_price = float(score_candle["close"]) if score_candle else ltp
+        if ltp <= 0 and score_candle:
+            ltp = score_price
         if day_open <= 0 and candles:
             day_open = float(candles[0]["open"])
-        day_gain = ((ltp - day_open) / day_open) if day_open > 0 and ltp > 0 else day_gain
+        day_gain = ((score_price - day_open) / day_open) if day_open > 0 and score_price > 0 else day_gain
 
         rel_vol = 0.0
-        if candles:
-            recent_10_vol = sum(int(candle.get("volume", 0) or 0) for candle in candles[-10:])
-            cumulative_vol = sum(int(candle.get("volume", 0) or 0) for candle in candles)
+        if score_candles:
+            recent_10_vol = sum(int(candle.get("volume", 0) or 0) for candle in score_candles[-10:])
+            cumulative_vol = sum(int(candle.get("volume", 0) or 0) for candle in score_candles)
             elapsed_mins = max(
                 1,
-                int((now - now.replace(hour=9, minute=15, second=0, microsecond=0)).total_seconds() // 60) + 1,
+                int((signal_cutoff - signal_cutoff.replace(hour=9, minute=15, second=0, microsecond=0)).total_seconds() // 60) + 1,
             )
             expected_10_vol = (cumulative_vol / elapsed_mins) * min(10, elapsed_mins) if cumulative_vol > 0 else 0
             rel_vol = (recent_10_vol / expected_10_vol) if expected_10_vol > 0 else 0.0
@@ -1003,11 +1044,11 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
             score += 10
         if day_gain > 0.09:
             score -= 15
-        if candles:
-            last = candles[-1]
-            if float(last["close"]) < float(last["open"]) and day_gain < 0.04:
+        if score_candle:
+            if float(score_candle["close"]) < float(score_candle["open"]) and day_gain < 0.04:
                 score -= 8
 
+        score_candle_time = _parse_candle_time(score_candle.get("time")) if score_candle else None
         features = {
             "runner_score": int(score),
             "score_model": "FINAL_BUY_1M",
@@ -1018,6 +1059,8 @@ def _compute_runner_score(symbol: str, now: datetime | None = None) -> tuple[int
             "day_gain_pct": round(day_gain * 100, 2),
             "rel_vol_10m": round(rel_vol, 2),
             "ltp": round(ltp, 2) if ltp else None,
+            "score_candle_time": score_candle_time.isoformat() if score_candle_time else None,
+            "score_signal_cutoff": signal_cutoff.isoformat(),
         }
         return int(score), features
 
@@ -1151,14 +1194,17 @@ def _build_depth_context(symbol: str, signal_price: float) -> dict:
 
 
 def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
-    candles = _get_1min_candles(symbol, n=5)
+    queued_at = _now()
+    candles = _get_1min_candles(symbol, n=10)
     if not candles:
         log.info("QUEUE SKIPPED %s | reason=NO_1M_DATA", symbol)
         return False
 
-    signal_candle = candles[-1]
-    signal_time = _parse_candle_time(signal_candle.get("time")) or _now()
-    queued_at = _now()
+    signal_candle, signal_time, signal_cutoff, signal_source = _select_alert_signal_candle(candles, queued_at)
+    if not signal_candle:
+        log.info("QUEUE SKIPPED %s | reason=NO_SIGNAL_CANDLE", symbol)
+        return False
+    signal_time = signal_time or signal_cutoff
 
     with state_lock:
         pending[symbol] = {
@@ -1168,7 +1214,13 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
             "signal_close": float(signal_candle["close"]),
             "signal_candle_time": signal_time,
             "last_candle_check": signal_time,
-            "signal_payload": {"high": float(signal_candle["high"]), "close": float(signal_candle["close"])},
+            "signal_payload": {
+                "high": float(signal_candle["high"]),
+                "close": float(signal_candle["close"]),
+                "time": signal_time.isoformat(),
+                "cutoff": signal_cutoff.isoformat(),
+                "source": signal_source,
+            },
             "depth_signal_ctx": {"gate_reason": "NOT_EVALUATED_AT_QUEUE"},
             "runner_ctx": runner_ctx or {},
             "mode": (runner_ctx or {}).get("mode", "BASE"),
@@ -1183,6 +1235,10 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
             "symbol": symbol,
             "signal_high": float(signal_candle["high"]),
             "signal_close": float(signal_candle["close"]),
+            "signal_candle_time": signal_time.isoformat(),
+            "signal_cutoff": signal_cutoff.isoformat(),
+            "signal_source": signal_source,
+            "queued_at": queued_at.isoformat(),
             "expires_at": (queued_at + timedelta(minutes=SMART_ENTRY_MINS)).isoformat(),
             "runner_ctx": _serialize_value(runner_ctx or {}),
         },
@@ -1197,6 +1253,8 @@ def _queue_signal(symbol: str, runner_ctx: dict | None = None) -> bool:
                 "symbol": symbol,
                 "signal_high": float(signal_candle["high"]),
                 "signal_close": float(signal_candle["close"]),
+                "signal_candle_time": signal_time.isoformat(),
+                "signal_source": signal_source,
                 "queued_at": queued_at.isoformat(),
                 "depth": _serialize_value(
                     {
