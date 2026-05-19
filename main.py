@@ -363,6 +363,13 @@ def _parse_chartink_time(raw) -> datetime | None:
             return datetime.strptime(normalized, fmt).replace(tzinfo=IST)
         except ValueError:
             continue
+
+    for fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+        try:
+            parsed_time = datetime.strptime(normalized, fmt).time()
+            return datetime.combine(_now().date(), parsed_time, tzinfo=IST)
+        except ValueError:
+            continue
     return _parse_candle_time(text)
 
 
@@ -468,6 +475,11 @@ def _timestamp_from_payload_item(item: dict) -> datetime | None:
         value = item.get(key)
         parsed = _parse_chartink_time(value)
         if parsed is not None:
+            # Chartink exposes triggered_at as the alert delivery/trigger time,
+            # not a true candle timestamp. For 1m close-based alerts, the
+            # signal candle is the previous completed minute.
+            if key in ("triggered_at", "trigger_time"):
+                return parsed - timedelta(minutes=1)
             return parsed
     return None
 
