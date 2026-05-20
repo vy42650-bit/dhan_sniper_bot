@@ -110,6 +110,8 @@ EVENT_DB_FILE = os.path.join(LOG_DIR, "runtime_events.sqlite3")
 MAX_RECENT_SHADOW_EVENTS = 500
 STATE_SAVE_DEBOUNCE_SECS = float(os.getenv("STATE_SAVE_DEBOUNCE_SECS", "1.0"))
 QUOTE_CACHE_TTL_SECS = float(os.getenv("QUOTE_CACHE_TTL_SECS", "1.0"))
+QUOTE_FAILURE_CACHE_SECS = float(os.getenv("QUOTE_FAILURE_CACHE_SECS", "5.0"))
+QUOTE_RATE_LIMIT_BACKOFF_SECS = float(os.getenv("QUOTE_RATE_LIMIT_BACKOFF_SECS", "20.0"))
 CANDLE_CACHE_TTL_SECS = float(os.getenv("CANDLE_CACHE_TTL_SECS", "12.0"))
 
 BLACKLIST = {"MEESHO", "MEESHO-BE"}
@@ -143,6 +145,7 @@ SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "3.0"))
 TRIGGER_SHADOW_TICK = float(os.getenv("TRIGGER_SHADOW_TICK", "0.05"))
 TRIGGER_SHADOW_LIMIT_BUFFER_PCT = float(os.getenv("TRIGGER_SHADOW_LIMIT_BUFFER_PCT", "0.002"))
 TRIGGER_SHADOW_VALID_MINS = int(os.getenv("TRIGGER_SHADOW_VALID_MINS", str(SMART_ENTRY_MINS)))
+TRIGGER_SHADOW_POLL_SECS = float(os.getenv("TRIGGER_SHADOW_POLL_SECS", "5.0"))
 
 pool_1m: dict[str, list[datetime]] = {}
 pool_3m: dict[str, list[datetime]] = {}
@@ -165,6 +168,7 @@ order_counter = itertools.count(1)
 state_dirty = False
 last_state_save_ts = 0.0
 quote_cache: dict[str, dict] = {}
+quote_failure_cache: dict[str, dict] = {}
 candle_cache: dict[str, dict] = {}
 shadow_recent_events = deque(maxlen=MAX_RECENT_SHADOW_EVENTS)
 
@@ -534,7 +538,7 @@ def _pool_from_json(raw: dict) -> dict[str, list[datetime]]:
 
 def _position_from_json(raw: dict) -> dict:
     data = dict(raw or {})
-    for key in ("entry_time", "signal_candle_time"):
+    for key in ("entry_time", "signal_candle_time", "last_ltp_check"):
         if key in data:
             data[key] = _parse_dt(data.get(key))
     return data
@@ -542,7 +546,7 @@ def _position_from_json(raw: dict) -> dict:
 
 def _pending_from_json(raw: dict) -> dict:
     data = dict(raw or {})
-    for key in ("queued_at", "expires_at", "signal_candle_time", "last_candle_check", "armed_at", "triggered_at"):
+    for key in ("queued_at", "expires_at", "signal_candle_time", "last_candle_check", "armed_at", "triggered_at", "last_ltp_check"):
         if key in data:
             data[key] = _parse_dt(data.get(key))
     return data
@@ -811,9 +815,16 @@ depth_manager = DepthFeedManager(
 
 def _get_quote_snapshot(symbol: str) -> dict | None:
     cache_key = symbol.upper()
+    now_ts = time.time()
     cached = quote_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) <= QUOTE_CACHE_TTL_SECS:
+    if cached and (now_ts - cached["ts"]) <= QUOTE_CACHE_TTL_SECS:
         return dict(cached["quote"])
+
+    failed = quote_failure_cache.get(cache_key)
+    if failed:
+        backoff = QUOTE_RATE_LIMIT_BACKOFF_SECS if failed.get("rate_limited") else QUOTE_FAILURE_CACHE_SECS
+        if (now_ts - failed["ts"]) <= backoff:
+            return None
 
     try:
         _ensure_dhan_data()
@@ -826,13 +837,46 @@ def _get_quote_snapshot(symbol: str) -> dict | None:
 
         resp = dhan_data.quote_data({"NSE_EQ": [int(sec_id)]})
         if resp.get("status") != "success":
+            raw_message = json.dumps(_serialize_value(resp), default=str)
+            rate_limited = "805" in raw_message or "too many request" in raw_message.lower()
+            previous = quote_failure_cache.get(cache_key) or {}
+            quote_failure_cache[cache_key] = {
+                "ts": now_ts,
+                "message": raw_message[:500],
+                "rate_limited": rate_limited,
+                "last_log_ts": previous.get("last_log_ts", 0.0),
+            }
+            if (now_ts - float(previous.get("last_log_ts", 0.0) or 0.0)) >= 30:
+                quote_failure_cache[cache_key]["last_log_ts"] = now_ts
+                _append_event(
+                    "baseline",
+                    "quote_fetch_failed",
+                    {
+                        "symbol": cache_key,
+                        "security_id": str(sec_id),
+                        "rate_limited": rate_limited,
+                        "backoff_secs": QUOTE_RATE_LIMIT_BACKOFF_SECS if rate_limited else QUOTE_FAILURE_CACHE_SECS,
+                        "response": raw_message[:500],
+                    },
+                )
             return None
 
         quote = resp["data"]["data"]["NSE_EQ"].get(str(sec_id), {})
         quote["security_id"] = str(sec_id)
-        quote_cache[cache_key] = {"ts": time.time(), "quote": dict(quote)}
+        quote_cache[cache_key] = {"ts": now_ts, "quote": dict(quote)}
+        quote_failure_cache.pop(cache_key, None)
         return quote
-    except Exception:
+    except Exception as exc:
+        previous = quote_failure_cache.get(cache_key) or {}
+        quote_failure_cache[cache_key] = {
+            "ts": now_ts,
+            "message": str(exc)[:500],
+            "rate_limited": False,
+            "last_log_ts": previous.get("last_log_ts", 0.0),
+        }
+        if (now_ts - float(previous.get("last_log_ts", 0.0) or 0.0)) >= 30:
+            quote_failure_cache[cache_key]["last_log_ts"] = now_ts
+            _append_event("baseline", "quote_fetch_failed", {"symbol": cache_key, "error": str(exc)[:500]})
         return None
 
 
@@ -1609,6 +1653,7 @@ def _arm_trigger_shadow_order(symbol: str, signal_candle: dict, signal_time: dat
                 "expires_at": now + timedelta(minutes=TRIGGER_SHADOW_VALID_MINS),
                 "signal_candle_time": signal_time,
                 "last_candle_check": signal_time,
+                "last_ltp_check": None,
                 "signal_high": signal_high,
                 "signal_close": float(signal_candle["close"]),
                 "trigger_price": trigger_price,
@@ -1707,6 +1752,7 @@ def _open_trigger_shadow_position(symbol: str, order: dict, fill_price: float, f
             "trigger_price": order["trigger_price"],
             "limit_price": order["limit_price"],
             "signal_candle_time": order["signal_candle_time"],
+            "last_ltp_check": None,
         }
         _mark_state_dirty()
 
@@ -2140,6 +2186,16 @@ def _evaluate_trigger_shadow_orders():
                 open_count += 1
                 continue
 
+        last_ltp_check = order.get("last_ltp_check")
+        if last_ltp_check and (now - last_ltp_check).total_seconds() < TRIGGER_SHADOW_POLL_SECS:
+            continue
+        with state_lock:
+            live_order = trigger_shadow_orders.get(symbol)
+            if live_order is None:
+                continue
+            live_order["last_ltp_check"] = now
+            _mark_state_dirty()
+
         ltp = _get_ltp(symbol)
         if ltp is None:
             continue
@@ -2182,6 +2238,16 @@ def _evaluate_trigger_shadow_positions():
     now = _now()
     eod = _is_eod(now)
     for symbol, pos in snapshot:
+        last_ltp_check = pos.get("last_ltp_check")
+        if last_ltp_check and (now - last_ltp_check).total_seconds() < TRIGGER_SHADOW_POLL_SECS:
+            continue
+        with state_lock:
+            live_pos = trigger_shadow_positions.get(symbol)
+            if live_pos is None:
+                continue
+            live_pos["last_ltp_check"] = now
+            _mark_state_dirty()
+
         ltp = _get_ltp(symbol)
         if ltp is None:
             continue
