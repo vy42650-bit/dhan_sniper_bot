@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from dhanhq import dhanhq
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template_string, request
 
 from depth_shadow import (
     CONFIG as DEPTH_CONFIG,
@@ -2473,6 +2473,121 @@ def dashboard():
             "railway_volume_mount_path": RAILWAY_VOLUME_ROOT,
         }
     )
+
+
+@app.get("/mobile")
+def mobile_dashboard():
+    today = _now().strftime("%Y-%m-%d")
+    with state_lock:
+        baseline_today = _filter_trades_by_day(_serialize_value(trades_today), today)
+        trigger_today = _filter_trades_by_day(_serialize_value(trigger_shadow_trades), today)
+        open_positions = _serialize_value(positions)
+        pending_count = len(pending)
+        trigger_open = _serialize_value(trigger_shadow_positions)
+        token_health = {
+            "main": _jwt_meta(MAIN_ACCESS_TOKEN, MAIN_CLIENT_ID, "MAIN_ACCESS_TOKEN"),
+            "sandbox": _jwt_meta(SANDBOX_ACCESS_TOKEN, SANDBOX_CLIENT_ID, "SANDBOX_ACCESS_TOKEN"),
+        }
+
+    baseline_pnl = round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in baseline_today), 2)
+    trigger_pnl = round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in trigger_today), 2)
+    return render_template_string(
+        """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="20">
+  <title>Dhan Bot Live</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #101418; color: #eef2f3; }
+    main { padding: 16px; max-width: 720px; margin: auto; }
+    .card { background: #182028; border: 1px solid #2b3945; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    .big { font-size: 30px; font-weight: 800; }
+    .good { color: #52d273; }
+    .bad { color: #ff6b6b; }
+    .muted { color: #9fb0bd; font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    td { padding: 7px 0; border-bottom: 1px solid #27323b; }
+    a { color: #8ec5ff; }
+  </style>
+</head>
+<body>
+<main>
+  <h2>Dhan Sniper Live</h2>
+  <div class="muted">Updated {{ now_ist }} | auto-refresh 20s</div>
+  <div class="card">
+    <div class="muted">Baseline realized P&L today</div>
+    <div class="big {{ 'good' if baseline_pnl >= 0 else 'bad' }}">Rs. {{ baseline_pnl }}</div>
+    <div>Closed trades: {{ baseline_count }} | Open: {{ open_count }} | Pending: {{ pending_count }}</div>
+  </div>
+  <div class="card">
+    <div class="muted">Open baseline positions</div>
+    {% if open_positions %}
+    <table>
+      {% for symbol, pos in open_positions.items() %}
+      <tr><td><b>{{ symbol }}</b></td><td>Entry {{ pos.entry }}</td><td>Qty {{ pos.qty }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div>No open baseline positions.</div>
+    {% endif %}
+  </div>
+  <div class="card">
+    <div class="muted">Trigger-shadow comparison</div>
+    <div>P&L: Rs. {{ trigger_pnl }} | Closed: {{ trigger_count }} | Open: {{ trigger_open_count }}</div>
+  </div>
+  <div class="card">
+    <div class="muted">Health</div>
+    <div>Status: ONLINE | Mode: {{ mode }}</div>
+    <div>Main token expired: {{ main_expired }} | Sandbox expired: {{ sandbox_expired }}</div>
+    <div>Depth connected: {{ depth_connected }}</div>
+  </div>
+  <div class="muted">
+    JSON links: <a href="/admin/trades?day={{ today }}">trades</a> |
+    <a href="/admin/events?day={{ today }}&limit=100">events</a>
+  </div>
+</main>
+</body>
+</html>
+        """,
+        today=today,
+        now_ist=_now().strftime("%Y-%m-%d %H:%M:%S IST"),
+        mode=TRADING_MODE,
+        baseline_pnl=baseline_pnl,
+        baseline_count=len(baseline_today),
+        open_count=len(open_positions),
+        open_positions=open_positions,
+        pending_count=pending_count,
+        trigger_pnl=trigger_pnl,
+        trigger_count=len(trigger_today),
+        trigger_open_count=len(trigger_open),
+        main_expired=token_health["main"].get("expired"),
+        sandbox_expired=token_health["sandbox"].get("expired"),
+        depth_connected=depth_manager.status().get("connected"),
+    )
+
+
+@app.get("/pnl")
+def pnl_text():
+    today = _now().strftime("%Y-%m-%d")
+    with state_lock:
+        baseline_today = _filter_trades_by_day(_serialize_value(trades_today), today)
+        open_symbols = sorted(positions.keys())
+        trigger_today = _filter_trades_by_day(_serialize_value(trigger_shadow_trades), today)
+        trigger_open_symbols = sorted(trigger_shadow_positions.keys())
+
+    baseline_pnl = round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in baseline_today), 2)
+    trigger_pnl = round(sum(float(trade.get("pnl_rs", 0) or 0) for trade in trigger_today), 2)
+    return (
+        f"Updated: {_now().strftime('%Y-%m-%d %H:%M:%S IST')}\n"
+        f"Baseline realized P&L today: Rs. {baseline_pnl}\n"
+        f"Baseline closed trades: {len(baseline_today)}\n"
+        f"Baseline open: {', '.join(open_symbols) if open_symbols else 'None'}\n"
+        f"Trigger-shadow realized P&L today: Rs. {trigger_pnl}\n"
+        f"Trigger-shadow open: {', '.join(trigger_open_symbols) if trigger_open_symbols else 'None'}\n"
+    ), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.get("/shadow")
