@@ -124,14 +124,15 @@ MASTER_SIZE = 15
 SMART_ENTRY_MINS = 3
 MAX_RED_CANDLE_PCT = 0.008
 SL_PCT = float(os.getenv("SL_PCT", "0.010"))
-TSL_TRIGGER_PCT = float(os.getenv("TSL_TRIGGER_PCT", "0.025"))
-TSL_TRAIL_PCT = float(os.getenv("TSL_TRAIL_PCT", "0.020"))
+TSL_TRIGGER_PCT = float(os.getenv("TSL_TRIGGER_PCT", "0.030"))
+TSL_TRAIL_PCT = float(os.getenv("TSL_TRAIL_PCT", "0.008"))
 TIME_EXIT_MINS = int(os.getenv("TIME_EXIT_MINS", "45"))
 WARMUP_END = _env_time("TRADING_START_TIME", "09:25")
+LAST_ENTRY_TIME = _env_time("LAST_ENTRY_TIME", "14:45")
 EOD_EXIT_TIME = dt_time(15, 29)
 MASTER_FILE = "master_list.json"
 SHADOW_SNAPSHOT_LOG_SECS = int(os.getenv("SHADOW_SNAPSHOT_LOG_SECS", "15"))
-RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "40"))
+RUNNER_OVERRIDE_SCORE = int(os.getenv("RUNNER_OVERRIDE_SCORE", "90"))
 RUNNER_MODE_SCORE = int(os.getenv("RUNNER_MODE_SCORE", "10000"))
 RUNNER_STALL_MINS = int(os.getenv("RUNNER_STALL_MINS", "90"))
 RUNNER_STALL_PEAK_PCT = float(os.getenv("RUNNER_STALL_PEAK_PCT", "0.04"))
@@ -139,7 +140,10 @@ RUNNER_TSL_TRIGGER_PCT = float(os.getenv("RUNNER_TSL_TRIGGER_PCT", "0.025"))
 RUNNER_TSL_TRAIL_PCT = float(os.getenv("RUNNER_TSL_TRAIL_PCT", "0.025"))
 ENTRY_CLOSE_POSITION_MIN = float(os.getenv("ENTRY_CLOSE_POSITION_MIN", "0.75"))
 ENTRY_VOLUME_CURR10_MIN = float(os.getenv("ENTRY_VOLUME_CURR10_MIN", "1.05"))
-SUPERTREND_EXIT_ENABLED = os.getenv("SUPERTREND_EXIT_ENABLED", "true").lower() == "true"
+FINAL_1M_RECENT_NORMAL_WINDOW_MINS = int(os.getenv("FINAL_1M_RECENT_NORMAL_WINDOW_MINS", "5"))
+FINAL_1M_RECENT_NORMAL_HITS = int(os.getenv("FINAL_1M_RECENT_NORMAL_HITS", "3"))
+FINAL_1M_SIGNAL_RELVOL10_MIN = float(os.getenv("FINAL_1M_SIGNAL_RELVOL10_MIN", "1.2"))
+SUPERTREND_EXIT_ENABLED = os.getenv("SUPERTREND_EXIT_ENABLED", "false").lower() == "true"
 SUPERTREND_ATR_PERIOD = int(os.getenv("SUPERTREND_ATR_PERIOD", "7"))
 SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "3.0"))
 TRIGGER_SHADOW_TICK = float(os.getenv("TRIGGER_SHADOW_TICK", "0.05"))
@@ -988,6 +992,14 @@ def _volume_curr10(candles: list[dict], idx: int) -> float | None:
     return int(candles[idx].get("volume", 0) or 0) / avg
 
 
+def _count_pool_hits_at_signal(pool: dict[str, list[datetime]], symbol: str, signal_time: datetime, minutes: int) -> int:
+    symbol = symbol.upper()
+    start = signal_time - timedelta(minutes=max(1, minutes) - 1)
+    with state_lock:
+        stamps = list(pool.get(symbol, []))
+    return sum(1 for stamp in stamps if start <= _floor_minute(stamp) <= signal_time)
+
+
 def _candle_close_position(candle: dict) -> float | None:
     high = float(candle.get("high", 0) or 0)
     low = float(candle.get("low", 0) or 0)
@@ -1207,6 +1219,7 @@ def _compute_runner_score(
         signal_cutoff = _alert_signal_cutoff(now, payload_time=payload_time)
         score_candles = _candles_until(candles, signal_cutoff) or candles
         score_candle = score_candles[-1] if score_candles else None
+        score_candle_idx = (len(score_candles) - 1) if score_candles else -1
         score_price = float(score_candle["close"]) if score_candle else ltp
         if ltp <= 0 and score_candle:
             ltp = score_price
@@ -1241,15 +1254,24 @@ def _compute_runner_score(
                 score -= 8
 
         score_candle_time = _parse_candle_time(score_candle.get("time")) if score_candle else None
+        signal_relvol10 = _volume_curr10(score_candles, score_candle_idx) if score_candle_idx >= 0 else None
+        recent_1m_hits_5m = (
+            _count_pool_hits_at_signal(pool_1m, symbol, _floor_minute(score_candle_time), FINAL_1M_RECENT_NORMAL_WINDOW_MINS)
+            if score_candle_time
+            else 0
+        )
         features = {
             "runner_score": int(score),
             "score_model": "FINAL_BUY_1M",
             "counts_1m": counts_1m,
+            "recent_1m_hits_5m": recent_1m_hits_5m,
+            "recent_1m_window_mins": FINAL_1M_RECENT_NORMAL_WINDOW_MINS,
             "counts_3m": counts_3m,
             "counts_5m": counts_5m,
             "final_buy_count": buy_count,
             "day_gain_pct": round(day_gain * 100, 2),
             "rel_vol_10m": round(rel_vol, 2),
+            "signal_relvol10": round(signal_relvol10, 2) if signal_relvol10 is not None else None,
             "ltp": round(ltp, 2) if ltp else None,
             "score_candle_time": score_candle_time.isoformat() if score_candle_time else None,
             "score_signal_cutoff": signal_cutoff.isoformat(),
@@ -1321,6 +1343,20 @@ def _runner_mode_for_score(score: int) -> str:
     if STRATEGY_MODE == "SUPREME_RUNNER_V2" and score >= RUNNER_MODE_SCORE:
         return "RUNNER"
     return "BASE"
+
+
+def _final_1m_quality_reject_reason(runner_ctx: dict, now: datetime | None = None) -> str | None:
+    current = now or _now()
+    if current.time() > LAST_ENTRY_TIME:
+        return "AFTER_LAST_ENTRY_TIME"
+    if int(runner_ctx.get("runner_score", 0) or 0) < RUNNER_OVERRIDE_SCORE:
+        return "SCORE_BELOW_FLOOR"
+    if int(runner_ctx.get("recent_1m_hits_5m", 0) or 0) < FINAL_1M_RECENT_NORMAL_HITS:
+        return "RECENT_1M_HITS_BELOW_FLOOR"
+    signal_relvol10 = runner_ctx.get("signal_relvol10")
+    if signal_relvol10 is None or float(signal_relvol10 or 0) < FINAL_1M_SIGNAL_RELVOL10_MIN:
+        return "SIGNAL_RELVOL10_BELOW_FLOOR"
+    return None
 
 
 def _is_market_warmup(now: datetime | None = None) -> bool:
@@ -1796,9 +1832,13 @@ def _close_trigger_shadow_position(symbol: str, pos: dict, reason: str, exit_pri
     _append_event("trigger_shadow", "exit_closed", trade)
 
 
-def _execute_entry(symbol: str, price: float, trigger: str) -> bool:
+def _execute_entry(symbol: str, price: float, trigger: str, runner_ctx: dict | None = None) -> bool:
     with state_lock:
         pending_meta = dict(pending.get(symbol) or {})
+        if runner_ctx:
+            pending_meta.setdefault("runner_ctx", runner_ctx)
+            pending_meta.setdefault("mode", runner_ctx.get("mode", "BASE"))
+            pending_meta.setdefault("runner_score", int(runner_ctx.get("runner_score", 0) or 0))
         if symbol in positions:
             pending.pop(symbol, None)
             _mark_state_dirty()
@@ -2370,14 +2410,24 @@ atexit.register(lambda: _save_runtime_state(force=True))
 
 
 def _ingest_symbols(pool: dict[str, list[datetime]], label: str):
-    symbols = _parse_symbols_from_request()
+    items = _parse_signal_items_from_request()
+    symbols = [item["symbol"] for item in items]
+    payload_times = {item["symbol"]: item.get("payload_time") for item in items if item.get("payload_time") is not None}
     now = _now()
     with state_lock:
         for symbol in symbols:
-            pool.setdefault(symbol, []).append(now)
+            pool.setdefault(symbol, []).append(payload_times.get(symbol) or now)
         _mark_state_dirty()
     _prune_all_pools(now)
-    _append_event("baseline", "scanner_ingest", {"label": label, "symbols": symbols})
+    _append_event(
+        "baseline",
+        "scanner_ingest",
+        {
+            "label": label,
+            "symbols": symbols,
+            "signal_times": {symbol: stamp.isoformat() for symbol, stamp in payload_times.items()},
+        },
+    )
     return symbols
 
 
@@ -2416,9 +2466,13 @@ def dashboard():
             "final_1m_config": {
                 "enabled": FINAL_1M_STRATEGY_ENABLED,
                 "trading_start_time": WARMUP_END.strftime("%H:%M"),
+                "last_entry_time": LAST_ENTRY_TIME.strftime("%H:%M"),
                 "order_fallback_to_paper": ORDER_FALLBACK_TO_PAPER,
-                "entry_close_position_min": ENTRY_CLOSE_POSITION_MIN,
-                "entry_volume_curr10_min": ENTRY_VOLUME_CURR10_MIN,
+                "entry_model": "DIRECT_ON_FINAL_BUY_IF_SCORE90_RECENT1M3_RELVOL12",
+                "score_floor": RUNNER_OVERRIDE_SCORE,
+                "recent_1m_hits_window_mins": FINAL_1M_RECENT_NORMAL_WINDOW_MINS,
+                "recent_1m_hits_floor": FINAL_1M_RECENT_NORMAL_HITS,
+                "signal_relvol10_floor": FINAL_1M_SIGNAL_RELVOL10_MIN,
                 "sl_pct": SL_PCT,
                 "tsl_trigger_pct": TSL_TRIGGER_PCT,
                 "tsl_trail_pct": TSL_TRAIL_PCT,
@@ -2712,12 +2766,15 @@ def wh_buy():
             "mode": _runner_mode_for_score(runner_score),
             "score_floor": RUNNER_OVERRIDE_SCORE,
             "final_1m_strategy_enabled": FINAL_1M_STRATEGY_ENABLED,
+            "recent_1m_hits_floor": FINAL_1M_RECENT_NORMAL_HITS,
+            "signal_relvol10_floor": FINAL_1M_SIGNAL_RELVOL10_MIN,
+            "last_entry_time": LAST_ENTRY_TIME.strftime("%H:%M"),
         }
         reason = None
         if symbol in BLACKLIST:
             reason = "BLACKLISTED"
-        elif FINAL_1M_STRATEGY_ENABLED and not final_1m_allowed:
-            reason = "SCORE_BELOW_FLOOR"
+        elif FINAL_1M_STRATEGY_ENABLED:
+            reason = _final_1m_quality_reject_reason(runner_ctx, now)
         elif not FINAL_1M_STRATEGY_ENABLED and not in_master and not runner_allowed:
             reason = "NOT_IN_MASTER"
         elif symbol in open_symbols:
@@ -2730,6 +2787,24 @@ def wh_buy():
         if reason:
             skipped.append({"symbol": symbol, "reason": reason})
             _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": reason, "runner_ctx": runner_ctx})
+            continue
+
+        if FINAL_1M_STRATEGY_ENABLED:
+            if len(positions) >= MAX_SLOTS:
+                skipped.append({"symbol": symbol, "reason": "SLOTS_FULL"})
+                _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": "SLOTS_FULL", "runner_ctx": runner_ctx})
+                continue
+            ltp = _get_ltp(symbol)
+            if ltp is None or ltp <= 0:
+                skipped.append({"symbol": symbol, "reason": "NO_LTP"})
+                _append_event("baseline", "buy_skipped", {"symbol": symbol, "reason": "NO_LTP", "runner_ctx": runner_ctx})
+                continue
+            if _execute_entry(symbol, float(ltp), "FINAL_1M_SCORE90_HITS3_RELVOL12", runner_ctx=runner_ctx):
+                queued.append(symbol)
+                open_symbols.add(symbol)
+                _append_event("baseline", "final_1m_entry_direct", {"symbol": symbol, "entry_price": round(float(ltp), 2), "runner_ctx": runner_ctx})
+            else:
+                skipped.append({"symbol": symbol, "reason": "ENTRY_FAILED_OR_SLOT_FULL"})
             continue
 
         if _queue_signal(symbol, runner_ctx=runner_ctx, payload_time=payload_time):
